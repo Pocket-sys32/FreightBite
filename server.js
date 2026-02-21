@@ -3,9 +3,11 @@ require('dotenv').config();
 
 const express = require('express');
 const http = require('http');
+const { EventEmitter } = require('events');
 const { Server } = require('socket.io');
 const { createClient } = require('@supabase/supabase-js');
-const { segmentLoad } = require('./services/segmentLoad');
+const db = require('./server/db');
+const { segmentLoad } = require('./server/segmentLoad');
 
 // Route modules
 const documentsRouter = require('./routes/documents');
@@ -66,6 +68,18 @@ const io = new Server(server, {
 });
 
 const PORT = process.env.PORT || 3000;
+const legEvents = new EventEmitter();
+
+function emitLegCompleted(leg) {
+  const payload = {
+    legId: leg.id,
+    driverId: leg.driver_id || null,
+    status: leg.status
+  };
+
+  legEvents.emit('leg.completed', payload);
+  io.emit('leg.completed', payload);
+}
 
 const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
 const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY;
@@ -82,7 +96,7 @@ io.on('connection', (socket) => {
 });
 
 /** POST /push-order — push a dummy order to all connected mobile clients */
-app.post('/push-order', (req, res) => {
+app.post('/push-order', async (req, res) => {
   const dummyOrder = {
     id: `ORD-${Date.now()}`,
     status: 'pending',
@@ -94,6 +108,31 @@ app.post('/push-order', (req, res) => {
     destination: { address: '123 Freight St', city: 'Logistics City', zip: '12345' },
     notes: 'Dummy order pushed from server'
   };
+
+  const loadDestination = `${dummyOrder.destination.address}, ${dummyOrder.destination.city} ${dummyOrder.destination.zip}`;
+  try {
+    const load = await db.createLoad({
+      origin: 'Warehouse A',
+      destination: loadDestination,
+      miles: 120,
+      status: 'OPEN'
+    });
+
+    await db.createLegs([
+      {
+        load_id: load.id,
+        sequence: 1,
+        origin: 'Warehouse A',
+        destination: loadDestination,
+        miles: 120,
+        handoff_point: 'Hub 1',
+        rate_cents: 125000,
+        status: 'OPEN'
+      }
+    ]);
+  } catch (error) {
+    console.error('Failed to persist dummy load:', error.message);
+  }
 
   io.emit('order', dummyOrder);
   console.log('Pushed order to clients:', dummyOrder.id);
@@ -132,96 +171,136 @@ app.get('/api/legs', async (req, res) => {
   res.json(data || []);
 });
 
-/** POST /api/loads/submit — origin + destination, OSRM segment into legs, save to Supabase */
-app.post('/api/loads/submit', async (req, res) => {
-  if (!supabase) {
-    return res.status(503).json({ error: 'Supabase not configured (set .env.local)' });
+const isValidLocation = (location) =>
+  location
+  && typeof location.lat === 'number'
+  && typeof location.lng === 'number';
+
+const safeParseJson = (value) => {
+  if (typeof value !== 'string') {
+    return value;
   }
-  const { origin, destination } = req.body || {};
-  if (!origin?.lat || origin?.lng === undefined || !destination?.lat || destination?.lng === undefined) {
-    return res.status(400).json({ error: 'Body must include origin: { lat, lng } and destination: { lat, lng }' });
-  }
+
   try {
-    const { totalMiles, legs } = await segmentLoad(
-      { lat: Number(origin.lat), lng: Number(origin.lng) },
-      { lat: Number(destination.lat), lng: Number(destination.lng) }
-    );
-    const firstLeg = legs[0];
-    const lastLeg = legs[legs.length - 1];
-    const { data: load, error: loadErr } = await supabase
-      .from('loads')
-      .insert({
-        origin: firstLeg.origin,
-        destination: lastLeg.destination,
-        miles: totalMiles,
-        status: 'pending'
-      })
-      .select('id')
-      .single();
-    if (loadErr) {
-      return res.status(500).json({ error: 'Failed to create load', details: loadErr.message });
-    }
-    const legRows = legs.map((leg) => ({
-      load_id: load.id,
-      sequence: leg.sequence,
-      origin: leg.origin,
-      destination: leg.destination,
-      miles: leg.miles,
-      handoff_point: leg.handoff_point,
-      rate_cents: Math.round(leg.miles * 200),
-      status: 'open'
-    }));
-    const { error: legsErr } = await supabase.from('legs').insert(legRows);
-    if (legsErr) {
-      return res.status(500).json({ error: 'Failed to create legs', details: legsErr.message });
-    }
-    const { data: createdLegs } = await supabase
-      .from('legs')
-      .select('id, sequence, origin, destination, miles, handoff_point, status')
-      .eq('load_id', load.id)
-      .order('sequence');
-    res.status(201).json({
-      load: { id: load.id, origin: firstLeg.origin, destination: lastLeg.destination, miles: totalMiles, status: 'pending' },
-      legs: createdLegs || legRows
+    return JSON.parse(value);
+  } catch (error) {
+    return value;
+  }
+};
+
+const hydrateLoad = (load) => ({
+  ...load,
+  origin: safeParseJson(load.origin),
+  destination: safeParseJson(load.destination)
+});
+
+const hydrateLeg = (leg) => ({
+  ...leg,
+  origin: safeParseJson(leg.origin),
+  destination: safeParseJson(leg.destination),
+  handoff_point: safeParseJson(leg.handoff_point)
+});
+
+/** POST /api/loads/submit — submit a load and segment into relay legs */
+app.post('/api/loads/submit', async (req, res) => {
+  const { origin, destination } = req.body || {};
+
+  if (!isValidLocation(origin) || !isValidLocation(destination)) {
+    return res.status(400).json({ error: 'origin and destination with lat/lng are required.' });
+  }
+
+  try {
+    const { totalMiles, legs } = await segmentLoad(origin, destination);
+    const loadRecord = await db.createLoad({
+      origin: JSON.stringify(origin),
+      destination: JSON.stringify(destination),
+      miles: totalMiles,
+      status: 'OPEN'
     });
-  } catch (err) {
-    console.error('segmentLoad error', err);
-    res.status(500).json({ error: err.message || 'Segmentation failed' });
+
+    const legRecords = await db.createLegs(
+      legs.map((leg) => ({
+        load_id: loadRecord.id,
+        sequence: leg.sequence,
+        origin: JSON.stringify(leg.origin),
+        destination: JSON.stringify(leg.destination),
+        miles: leg.miles,
+        handoff_point: JSON.stringify(leg.handoff_point),
+        rate_cents: 0,
+        status: leg.status,
+        driver_id: null
+      }))
+    );
+
+    return res.json({
+      load: hydrateLoad(loadRecord),
+      legs: legRecords.map(hydrateLeg)
+    });
+  } catch (error) {
+    const status = error.statusCode || 500;
+    return res.status(status).json({ error: error.message || 'Failed to submit load.' });
   }
 });
 
-/** POST /api/legs/:id/accept — driver accepts leg, status = in_transit */
+/** POST /api/legs/:id/accept — driver accepts leg, status = IN_TRANSIT */
 app.post('/api/legs/:id/accept', async (req, res) => {
-  if (!supabase) return res.status(503).json({ error: 'Supabase not configured' });
   const legId = req.params.id;
-  const driverId = req.body?.driver_id;
-  if (!driverId) return res.status(400).json({ error: 'Body must include driver_id' });
-  const { data, error } = await supabase
-    .from('legs')
-    .update({ status: 'in_transit', driver_id: driverId })
-    .eq('id', legId)
-    .eq('status', 'open')
-    .select()
-    .single();
-  if (error) return res.status(500).json({ error: error.message });
-  if (!data) return res.status(404).json({ error: 'Leg not found or already assigned' });
-  res.json(data);
+  const driverId = req.body?.driverId || req.body?.driver_id;
+
+  if (!driverId) {
+    return res.status(400).json({ error: 'Body must include driverId' });
+  }
+
+  try {
+    const leg = await db.getLegById(legId);
+    if (!leg) {
+      return res.status(404).json({ error: 'Leg not found' });
+    }
+
+    if (leg.status !== 'OPEN') {
+      return res.status(409).json({ error: 'Leg is not open' });
+    }
+
+    const updatedLeg = await db.updateLegStatus(legId, 'IN_TRANSIT', driverId);
+    return res.json(updatedLeg);
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to accept leg', details: error.message });
+  }
 });
 
-/** POST /api/legs/:id/complete — handoff done */
+/** POST /api/legs/:id/complete — driver completes leg */
 app.post('/api/legs/:id/complete', async (req, res) => {
-  if (!supabase) return res.status(503).json({ error: 'Supabase not configured' });
   const legId = req.params.id;
-  const { data, error } = await supabase
-    .from('legs')
-    .update({ status: 'completed' })
-    .eq('id', legId)
-    .in('status', ['open', 'in_transit'])
-    .select()
-    .single();
-  if (error) return res.status(500).json({ error: error.message });
-  if (!data) return res.status(404).json({ error: 'Leg not found or already completed' });
-  res.json(data);
+  const driverId = req.body?.driverId || req.body?.driver_id;
+
+  if (!driverId) {
+    return res.status(400).json({ error: 'Body must include driverId' });
+  }
+
+  try {
+    const leg = await db.getLegById(legId);
+    if (!leg) {
+      return res.status(404).json({ error: 'Leg not found' });
+    }
+
+    if (leg.driver_id !== driverId) {
+      return res.status(403).json({ error: 'Driver does not own this leg' });
+    }
+
+    if (leg.status !== 'IN_TRANSIT') {
+      return res.status(409).json({ error: 'Leg is not in transit' });
+    }
+
+    const updatedLeg = await db.updateLegStatus(legId, 'COMPLETE');
+    emitLegCompleted(updatedLeg);
+    return res.json(updatedLeg);
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to complete leg', details: error.message });
+  }
+});
+
+legEvents.on('leg.completed', (payload) => {
+  console.log('Leg completed event:', payload.legId);
 });
 
 server.listen(PORT, () => {
