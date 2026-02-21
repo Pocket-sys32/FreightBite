@@ -60,5 +60,5 @@ Backend runs on `http://localhost:3000`. UI runs on `http://localhost:3001`.
 ### Notes
 
 - On first backend start without Supabase, SQLite is used and a demo driver/contact are auto-seeded.
-- AI endpoints require `ANTHROPIC_API_KEY`. Without it, UI falls back gracefully on recommendation/draft generation.
+- AI endpoints use OpenAI (`gpt-4o-mini`) and require `OPENAI_API_KEY`. Without it, UI falls back gracefully on recommendation/draft generation.
 - Shipper submission accepts known city labels (e.g. `Chicago, IL`, `Los Angeles, CA`, `Melrose Park, IL`, `Rialto, CA`) or `lat,lng`.

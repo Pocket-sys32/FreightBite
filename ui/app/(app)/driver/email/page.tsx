@@ -14,8 +14,8 @@ import { cn } from "@/lib/utils"
 import { type BrokerContact, type Driver, type Leg } from "@/lib/mock-data"
 import {
   draftOutreachEmail,
+  fetchCurrentDriver,
   fetchDriverContacts,
-  fetchDrivers,
   fetchLegs,
 } from "@/lib/backend-api"
 
@@ -42,8 +42,7 @@ export default function EmailOutreachPage() {
       setLoading(true)
       setError(null)
       try {
-        const drivers = await fetchDrivers()
-        const selectedDriver = drivers[0] || null
+        const selectedDriver = await fetchCurrentDriver()
         setDriver(selectedDriver)
 
         if (!selectedDriver) {

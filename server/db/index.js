@@ -6,6 +6,15 @@ const sqlite3 = require('sqlite3');
 const { open } = require('sqlite');
 
 const STATUS_VALUES = new Set(['OPEN', 'IN_TRANSIT', 'COMPLETE']);
+const LEG_EVENT_TYPES = new Set([
+  'ASSIGNED',
+  'START_ROUTE',
+  'ARRIVED',
+  'HANDOFF_READY',
+  'HANDOFF_COMPLETE',
+  'AUTO_START_ROUTE'
+]);
+const HANDOFF_STATUS_VALUES = new Set(['PENDING', 'READY', 'COMPLETE']);
 
 const supabaseUrl = process.env.SUPABASE_URL;
 const supabaseKey = process.env.SUPABASE_SERVICE_ROLE_KEY || process.env.SUPABASE_ANON_KEY;
@@ -58,14 +67,61 @@ CREATE TABLE IF NOT EXISTS contacts (
   last_worked_together TEXT
 );
 
+CREATE TABLE IF NOT EXISTS accounts (
+  id TEXT PRIMARY KEY,
+  driver_id TEXT NOT NULL REFERENCES drivers(id) ON DELETE CASCADE,
+  email TEXT NOT NULL UNIQUE,
+  password_hash TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS leg_events (
+  id TEXT PRIMARY KEY,
+  leg_id TEXT NOT NULL REFERENCES legs(id) ON DELETE CASCADE,
+  load_id TEXT NOT NULL REFERENCES loads(id) ON DELETE CASCADE,
+  driver_id TEXT,
+  event_type TEXT NOT NULL,
+  payload TEXT,
+  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE TABLE IF NOT EXISTS handoffs (
+  id TEXT PRIMARY KEY,
+  load_id TEXT NOT NULL REFERENCES loads(id) ON DELETE CASCADE,
+  from_leg_id TEXT NOT NULL REFERENCES legs(id) ON DELETE CASCADE,
+  to_leg_id TEXT NOT NULL REFERENCES legs(id) ON DELETE CASCADE,
+  from_driver_id TEXT,
+  to_driver_id TEXT,
+  status TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(from_leg_id, to_leg_id)
+);
+
 CREATE INDEX IF NOT EXISTS legs_load_id_idx ON legs(load_id);
 CREATE INDEX IF NOT EXISTS legs_status_idx ON legs(status);
 CREATE INDEX IF NOT EXISTS contacts_driver_id_idx ON contacts(driver_id);
+CREATE INDEX IF NOT EXISTS accounts_email_idx ON accounts(email);
+CREATE INDEX IF NOT EXISTS accounts_driver_id_idx ON accounts(driver_id);
+CREATE INDEX IF NOT EXISTS leg_events_leg_id_idx ON leg_events(leg_id);
+CREATE INDEX IF NOT EXISTS handoffs_load_id_idx ON handoffs(load_id);
 `;
 
 function assertStatus(status) {
   if (!STATUS_VALUES.has(status)) {
     throw new Error(`Invalid status: ${status}`);
+  }
+}
+
+function assertLegEventType(eventType) {
+  if (!LEG_EVENT_TYPES.has(eventType)) {
+    throw new Error(`Invalid leg event type: ${eventType}`);
+  }
+}
+
+function assertHandoffStatus(status) {
+  if (!HANDOFF_STATUS_VALUES.has(status)) {
+    throw new Error(`Invalid handoff status: ${status}`);
   }
 }
 
@@ -264,6 +320,77 @@ async function createContact(contact) {
   return db.get('SELECT * FROM contacts WHERE id = ?', [id]);
 }
 
+async function createAccount(account) {
+  const payload = {
+    driver_id: account.driver_id,
+    email: account.email,
+    password_hash: account.password_hash
+  };
+
+  if (useSupabase) {
+    const { data, error } = await supabase
+      .from('accounts')
+      .insert(payload)
+      .select('*')
+      .single();
+
+    if (error) {
+      throw error;
+    }
+
+    return data;
+  }
+
+  const db = await getSqliteDb();
+  const id = account.id || crypto.randomUUID();
+  await db.run(
+    `INSERT INTO accounts (id, driver_id, email, password_hash)
+    VALUES (?, ?, ?, ?)`,
+    [id, payload.driver_id, payload.email, payload.password_hash]
+  );
+  return db.get('SELECT * FROM accounts WHERE id = ?', [id]);
+}
+
+async function getAccountByEmail(email) {
+  if (useSupabase) {
+    const { data, error } = await supabase
+      .from('accounts')
+      .select('*')
+      .ilike('email', email)
+      .maybeSingle();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return null;
+      }
+      throw error;
+    }
+
+    return data;
+  }
+
+  const db = await getSqliteDb();
+  return db.get('SELECT * FROM accounts WHERE lower(email) = lower(?)', [email]);
+}
+
+async function getDriverByAccountEmail(email) {
+  if (useSupabase) {
+    const account = await getAccountByEmail(email);
+    if (!account) {
+      return null;
+    }
+    return getDriverById(account.driver_id);
+  }
+
+  const db = await getSqliteDb();
+  return db.get(
+    `SELECT d.* FROM drivers d
+    INNER JOIN accounts a ON a.driver_id = d.id
+    WHERE lower(a.email) = lower(?)`,
+    [email]
+  );
+}
+
 async function getLoadById(id) {
   if (useSupabase) {
     const { data, error } = await supabase
@@ -308,6 +435,29 @@ async function getLegById(id) {
   return db.get('SELECT * FROM legs WHERE id = ?', [id]);
 }
 
+async function getLegByLoadSequence(loadId, sequence) {
+  if (useSupabase) {
+    const { data, error } = await supabase
+      .from('legs')
+      .select('*')
+      .eq('load_id', loadId)
+      .eq('sequence', sequence)
+      .maybeSingle();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return null;
+      }
+      throw error;
+    }
+
+    return data;
+  }
+
+  const db = await getSqliteDb();
+  return db.get('SELECT * FROM legs WHERE load_id = ? AND sequence = ?', [loadId, sequence]);
+}
+
 async function updateLegStatus(id, status, driverId) {
   assertStatus(status);
 
@@ -340,6 +490,184 @@ async function updateLegStatus(id, status, driverId) {
   }
 
   return db.get('SELECT * FROM legs WHERE id = ?', [id]);
+}
+
+async function createLegEvent(event) {
+  assertLegEventType(event.event_type);
+
+  const payload = {
+    id: event.id || crypto.randomUUID(),
+    leg_id: event.leg_id,
+    load_id: event.load_id,
+    driver_id: event.driver_id || null,
+    event_type: event.event_type,
+    payload: event.payload ? JSON.stringify(event.payload) : null
+  };
+
+  if (useSupabase) {
+    const { data, error } = await supabase
+      .from('leg_events')
+      .insert(payload)
+      .select('*')
+      .single();
+
+    if (error) {
+      throw error;
+    }
+
+    return data;
+  }
+
+  const db = await getSqliteDb();
+  await db.run(
+    `INSERT INTO leg_events
+    (id, leg_id, load_id, driver_id, event_type, payload)
+    VALUES (?, ?, ?, ?, ?, ?)`,
+    [payload.id, payload.leg_id, payload.load_id, payload.driver_id, payload.event_type, payload.payload]
+  );
+  return db.get('SELECT * FROM leg_events WHERE id = ?', [payload.id]);
+}
+
+async function listLegEventsByLeg(legId) {
+  if (useSupabase) {
+    const { data, error } = await supabase
+      .from('leg_events')
+      .select('*')
+      .eq('leg_id', legId)
+      .order('created_at', { ascending: true });
+
+    if (error) {
+      throw error;
+    }
+
+    return data || [];
+  }
+
+  const db = await getSqliteDb();
+  return db.all('SELECT * FROM leg_events WHERE leg_id = ? ORDER BY datetime(created_at) ASC', [legId]);
+}
+
+async function getLatestLegEvent(legId) {
+  if (useSupabase) {
+    const { data, error } = await supabase
+      .from('leg_events')
+      .select('*')
+      .eq('leg_id', legId)
+      .order('created_at', { ascending: false })
+      .limit(1)
+      .maybeSingle();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return null;
+      }
+      throw error;
+    }
+
+    return data;
+  }
+
+  const db = await getSqliteDb();
+  return db.get('SELECT * FROM leg_events WHERE leg_id = ? ORDER BY datetime(created_at) DESC LIMIT 1', [legId]);
+}
+
+async function upsertHandoff(handoff) {
+  assertHandoffStatus(handoff.status);
+
+  const payload = {
+    id: handoff.id || crypto.randomUUID(),
+    load_id: handoff.load_id,
+    from_leg_id: handoff.from_leg_id,
+    to_leg_id: handoff.to_leg_id,
+    from_driver_id: handoff.from_driver_id || null,
+    to_driver_id: handoff.to_driver_id || null,
+    status: handoff.status
+  };
+
+  if (useSupabase) {
+    const { data, error } = await supabase
+      .from('handoffs')
+      .upsert(payload, { onConflict: 'from_leg_id,to_leg_id' })
+      .select('*')
+      .single();
+
+    if (error) {
+      throw error;
+    }
+
+    return data;
+  }
+
+  const db = await getSqliteDb();
+  await db.run(
+    `INSERT INTO handoffs
+    (id, load_id, from_leg_id, to_leg_id, from_driver_id, to_driver_id, status)
+    VALUES (?, ?, ?, ?, ?, ?, ?)
+    ON CONFLICT(from_leg_id, to_leg_id) DO UPDATE SET
+      from_driver_id = excluded.from_driver_id,
+      to_driver_id = excluded.to_driver_id,
+      status = excluded.status,
+      updated_at = datetime('now')`,
+    [
+      payload.id,
+      payload.load_id,
+      payload.from_leg_id,
+      payload.to_leg_id,
+      payload.from_driver_id,
+      payload.to_driver_id,
+      payload.status
+    ]
+  );
+
+  return db.get(
+    'SELECT * FROM handoffs WHERE from_leg_id = ? AND to_leg_id = ?',
+    [payload.from_leg_id, payload.to_leg_id]
+  );
+}
+
+async function getHandoffByLegs(fromLegId, toLegId) {
+  if (useSupabase) {
+    const { data, error } = await supabase
+      .from('handoffs')
+      .select('*')
+      .eq('from_leg_id', fromLegId)
+      .eq('to_leg_id', toLegId)
+      .maybeSingle();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return null;
+      }
+      throw error;
+    }
+
+    return data;
+  }
+
+  const db = await getSqliteDb();
+  return db.get('SELECT * FROM handoffs WHERE from_leg_id = ? AND to_leg_id = ?', [fromLegId, toLegId]);
+}
+
+async function listHandoffsByLeg(legId) {
+  if (useSupabase) {
+    const { data, error } = await supabase
+      .from('handoffs')
+      .select('*')
+      .or(`from_leg_id.eq.${legId},to_leg_id.eq.${legId}`)
+      .order('updated_at', { ascending: false });
+
+    if (error) {
+      throw error;
+    }
+
+    return data || [];
+  }
+
+  const db = await getSqliteDb();
+  return db.all(
+    'SELECT * FROM handoffs WHERE from_leg_id = ? OR to_leg_id = ? ORDER BY datetime(updated_at) DESC',
+    [legId, legId]
+  );
 }
 
 async function listLoads({ status, limit = 50 } = {}) {
@@ -378,7 +706,7 @@ async function listLoads({ status, limit = 50 } = {}) {
   return db.all(sql, params);
 }
 
-async function listLegs({ status, loadId, limit = 100 } = {}) {
+async function listLegs({ status, loadId, driverId, limit = 100 } = {}) {
   const safeLimit = Math.max(1, Math.min(Number(limit) || 100, 500));
 
   if (useSupabase) {
@@ -394,6 +722,10 @@ async function listLegs({ status, loadId, limit = 100 } = {}) {
 
     if (loadId) {
       query = query.eq('load_id', loadId);
+    }
+
+    if (driverId) {
+      query = query.eq('driver_id', driverId);
     }
 
     const { data, error } = await query;
@@ -416,6 +748,11 @@ async function listLegs({ status, loadId, limit = 100 } = {}) {
   if (loadId) {
     clauses.push('load_id = ?');
     params.push(loadId);
+  }
+
+  if (driverId) {
+    clauses.push('driver_id = ?');
+    params.push(driverId);
   }
 
   let sql = 'SELECT * FROM legs';
@@ -473,6 +810,28 @@ async function getDriverById(id) {
 
   const db = await getSqliteDb();
   return db.get('SELECT * FROM drivers WHERE id = ?', [id]);
+}
+
+async function getDriverByEmail(email) {
+  if (useSupabase) {
+    const { data, error } = await supabase
+      .from('drivers')
+      .select('*')
+      .ilike('email', email)
+      .maybeSingle();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return null;
+      }
+      throw error;
+    }
+
+    return data;
+  }
+
+  const db = await getSqliteDb();
+  return db.get('SELECT * FROM drivers WHERE lower(email) = lower(?)', [email]);
 }
 
 async function getContactById(id) {
@@ -546,14 +905,25 @@ module.exports = {
   createLegs,
   createDriver,
   createContact,
+  createAccount,
   getLoadById,
   getLegById,
+  getLegByLoadSequence,
+  getAccountByEmail,
+  getDriverByAccountEmail,
   listLoads,
   listLegs,
   listLegsByLoad,
   updateLegStatus,
+  createLegEvent,
+  listLegEventsByLeg,
+  getLatestLegEvent,
+  upsertHandoff,
+  getHandoffByLegs,
+  listHandoffsByLeg,
   listDrivers,
   getDriverById,
+  getDriverByEmail,
   getContactById,
   listOpenLegsNear,
   listContactsByDriver

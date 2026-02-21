@@ -15,7 +15,7 @@ import {
 import { cn } from "@/lib/utils"
 import { type Driver, HOS_RULES, type NearbyLoad } from "@/lib/mock-data"
 import {
-  fetchDrivers,
+  fetchCurrentDriver,
   fetchLegs,
   fetchWhatsNextRecommendation,
   legsToNearbyLoads,
@@ -45,8 +45,7 @@ export default function WhatsNextPage() {
       setLoading(true)
       setError(null)
       try {
-        const drivers = await fetchDrivers()
-        const selectedDriver = drivers[0] || null
+        const selectedDriver = await fetchCurrentDriver()
         setDriver(selectedDriver)
 
         const openLegs = await fetchLegs({ status: "OPEN" })

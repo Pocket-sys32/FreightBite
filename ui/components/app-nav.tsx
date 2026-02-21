@@ -1,7 +1,7 @@
 "use client"
 
 import Link from "next/link"
-import { usePathname } from "next/navigation"
+import { usePathname, useRouter } from "next/navigation"
 import { cn } from "@/lib/utils"
 import {
   Truck,
@@ -10,8 +10,11 @@ import {
   Mail,
   Wifi,
   WifiOff,
+  LogOut,
 } from "lucide-react"
 import { useState, useEffect } from "react"
+import { clearAuthToken, fetchCurrentDriver } from "@/lib/backend-api"
+import { getSupabaseClient, hasSupabaseAuthConfig } from "@/lib/supabase-client"
 
 const NAV_ITEMS = [
   { href: "/driver", label: "Loads", icon: LayoutDashboard },
@@ -20,8 +23,10 @@ const NAV_ITEMS = [
 ]
 
 export function AppNav() {
+  const router = useRouter()
   const pathname = usePathname()
   const [online, setOnline] = useState(true)
+  const [driverInitials, setDriverInitials] = useState("DR")
 
   useEffect(() => {
     const handleOnline = () => setOnline(true)
@@ -34,6 +39,37 @@ export function AppNav() {
       window.removeEventListener("offline", handleOffline)
     }
   }, [])
+
+  useEffect(() => {
+    let active = true
+    const loadDriver = async () => {
+      const driver = await fetchCurrentDriver()
+      if (!active || !driver) return
+      const initials = driver.name
+        .split(" ")
+        .map((part) => part[0])
+        .join("")
+        .slice(0, 2)
+        .toUpperCase()
+      setDriverInitials(initials || "DR")
+    }
+    void loadDriver()
+    return () => {
+      active = false
+    }
+  }, [])
+
+  const handleLogout = async () => {
+    if (hasSupabaseAuthConfig()) {
+      try {
+        await getSupabaseClient().auth.signOut()
+      } catch {
+        // no-op: we still clear local backend token below
+      }
+    }
+    clearAuthToken()
+    router.push("/auth")
+  }
 
   return (
     <header className="sticky top-0 z-50 border-b border-border bg-card/95 backdrop-blur-md">
@@ -84,8 +120,15 @@ export function AppNav() {
             <span className="hidden sm:inline">{online ? "Synced" : "Offline"}</span>
           </div>
           <div className="h-9 w-9 rounded-lg bg-secondary flex items-center justify-center text-xs font-bold text-foreground">
-            MT
+            {driverInitials}
           </div>
+          <button
+            onClick={handleLogout}
+            className="h-9 w-9 rounded-lg bg-secondary flex items-center justify-center text-muted-foreground hover:text-foreground transition-colors"
+            title="Sign out"
+          >
+            <LogOut className="h-4 w-4" />
+          </button>
         </div>
       </div>
     </header>

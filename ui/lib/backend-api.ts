@@ -1,5 +1,26 @@
 import type { BrokerContact, Driver, Leg, LegStatus, Load, NearbyLoad } from "@/lib/mock-data"
 
+const AUTH_TOKEN_KEY = "freightbite_driver_token"
+
+function isBrowser() {
+  return typeof window !== "undefined"
+}
+
+export function getAuthToken(): string | null {
+  if (!isBrowser()) return null
+  return window.localStorage.getItem(AUTH_TOKEN_KEY)
+}
+
+export function saveAuthToken(token: string) {
+  if (!isBrowser()) return
+  window.localStorage.setItem(AUTH_TOKEN_KEY, token)
+}
+
+export function clearAuthToken() {
+  if (!isBrowser()) return
+  window.localStorage.removeItem(AUTH_TOKEN_KEY)
+}
+
 type RawPoint =
   | string
   | {
@@ -50,6 +71,102 @@ interface RawContact {
   broker_name?: string | null
   broker_email?: string | null
   last_worked_together?: string | null
+}
+
+interface RawLegEvent {
+  id: string
+  leg_id: string
+  driver_id?: string | null
+  event_type: string
+  payload?: unknown
+  created_at?: string
+}
+
+interface RawHandoff {
+  id: string
+  from_leg_id: string
+  to_leg_id: string
+  from_driver_id?: string | null
+  to_driver_id?: string | null
+  status: "PENDING" | "READY" | "COMPLETE"
+  updated_at?: string
+}
+
+interface RawLegWorkflow {
+  phase: string
+  latestEvent: RawLegEvent | null
+  events: RawLegEvent[]
+  previousLeg: RawLeg | null
+  nextLeg: RawLeg | null
+  handoffs: RawHandoff[]
+}
+
+interface RawDirections {
+  legId: string
+  from: { lat: number; lng: number; label: string }
+  to: { lat: number; lng: number; label: string }
+  directions: {
+    distanceMiles: number
+    durationMinutes: number
+    geometry: number[][]
+    steps: Array<{
+      distanceMiles: number
+      durationMinutes: number
+      name: string
+      maneuver: string
+      instruction: string
+      location: { lat: number; lng: number } | null
+    }>
+  }
+}
+
+export interface LegEvent {
+  id: string
+  legId: string
+  driverId: string | null
+  eventType: string
+  payload: unknown
+  createdAt: string | null
+}
+
+export interface HandoffLink {
+  id: string
+  fromLegId: string
+  toLegId: string
+  fromDriverId: string | null
+  toDriverId: string | null
+  status: "PENDING" | "READY" | "COMPLETE"
+  updatedAt: string | null
+}
+
+export interface LegWorkflow {
+  phase: string
+  latestEvent: LegEvent | null
+  events: LegEvent[]
+  previousLeg: Leg | null
+  nextLeg: Leg | null
+  handoffs: HandoffLink[]
+}
+
+export interface LegDirectionsStep {
+  distanceMiles: number
+  durationMinutes: number
+  name: string
+  maneuver: string
+  instruction: string
+  location: { lat: number; lng: number } | null
+}
+
+export interface LegDirections {
+  legId: string
+  from: { lat: number; lng: number; label: string }
+  to: { lat: number; lng: number; label: string }
+  directions: {
+    distanceMiles: number
+    durationMinutes: number
+    geometry: Array<{ lat: number; lng: number }>
+    steps: LegDirectionsStep[]
+  }
 }
 
 const KNOWN_LOCATIONS: Record<string, { lat: number; lng: number; label: string }> = {
@@ -146,17 +263,30 @@ function nearestKnownLabel(lat?: number | null, lng?: number | null, fallback = 
 }
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const token = getAuthToken()
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    ...(init?.headers ? (init.headers as Record<string, string>) : {}),
+  }
+
+  if (token && !headers.Authorization) {
+    headers.Authorization = `Bearer ${token}`
+  }
+
   const response = await fetch(path, {
     ...init,
-    headers: {
-      "Content-Type": "application/json",
-      ...(init?.headers || {}),
-    },
+    headers,
   })
 
   if (!response.ok) {
     const text = await response.text()
-    throw new Error(text || `API request failed (${response.status})`)
+    try {
+      const parsed = JSON.parse(text) as { error?: string; details?: string }
+      const details = parsed.details ? ` (${parsed.details})` : ""
+      throw new Error((parsed.error || text || `API request failed (${response.status})`) + details)
+    } catch {
+      throw new Error(text || `API request failed (${response.status})`)
+    }
   }
 
   return response.json() as Promise<T>
@@ -234,6 +364,55 @@ function mapLeg(raw: RawLeg, driverNameById: Map<string, string>): Leg {
     estimatedDelivery: formatDate(deliveryDate),
     commodity: "General Freight",
     weight: 38000,
+  }
+}
+
+function mapLegEvent(raw: RawLegEvent | null | undefined): LegEvent | null {
+  if (!raw) return null
+  return {
+    id: raw.id,
+    legId: raw.leg_id,
+    driverId: raw.driver_id || null,
+    eventType: raw.event_type,
+    payload: raw.payload ?? null,
+    createdAt: raw.created_at || null,
+  }
+}
+
+function mapHandoff(raw: RawHandoff): HandoffLink {
+  return {
+    id: raw.id,
+    fromLegId: raw.from_leg_id,
+    toLegId: raw.to_leg_id,
+    fromDriverId: raw.from_driver_id || null,
+    toDriverId: raw.to_driver_id || null,
+    status: raw.status,
+    updatedAt: raw.updated_at || null,
+  }
+}
+
+function mapWorkflow(raw: RawLegWorkflow | null | undefined, driverNames: Map<string, string>): LegWorkflow {
+  return {
+    phase: raw?.phase || "OPEN",
+    latestEvent: mapLegEvent(raw?.latestEvent),
+    events: (raw?.events || []).map((event) => mapLegEvent(event)).filter(Boolean) as LegEvent[],
+    previousLeg: raw?.previousLeg ? mapLeg(raw.previousLeg, driverNames) : null,
+    nextLeg: raw?.nextLeg ? mapLeg(raw.nextLeg, driverNames) : null,
+    handoffs: (raw?.handoffs || []).map(mapHandoff),
+  }
+}
+
+function mapDirections(raw: RawDirections): LegDirections {
+  return {
+    legId: raw.legId,
+    from: raw.from,
+    to: raw.to,
+    directions: {
+      distanceMiles: raw.directions.distanceMiles,
+      durationMinutes: raw.directions.durationMinutes,
+      geometry: (raw.directions.geometry || []).map(([lng, lat]) => ({ lat, lng })),
+      steps: raw.directions.steps || [],
+    },
   }
 }
 
@@ -319,15 +498,67 @@ export async function fetchDrivers(): Promise<Driver[]> {
   return (raw || []).map(mapDriver)
 }
 
+export async function registerDriverAccount(input: {
+  name: string
+  email: string
+  password: string
+  currentLat?: number
+  currentLng?: number
+  homeLat?: number
+  homeLng?: number
+}) {
+  const response = await apiFetch<{ token: string; driver: RawDriver }>("/api/auth/register-driver", {
+    method: "POST",
+    body: JSON.stringify(input),
+  })
+  saveAuthToken(response.token)
+  return mapDriver(response.driver)
+}
+
+export async function loginDriverAccount(email: string, password: string) {
+  const response = await apiFetch<{ token: string; driver: RawDriver }>("/api/auth/login-driver", {
+    method: "POST",
+    body: JSON.stringify({ email, password }),
+  })
+  saveAuthToken(response.token)
+  return mapDriver(response.driver)
+}
+
+export async function createOAuthDriverSession(input: {
+  email: string
+  name?: string
+  currentLat?: number
+  currentLng?: number
+  homeLat?: number
+  homeLng?: number
+}) {
+  const response = await apiFetch<{ token: string; driver: RawDriver }>("/api/auth/oauth-session", {
+    method: "POST",
+    body: JSON.stringify(input),
+  })
+  saveAuthToken(response.token)
+  return mapDriver(response.driver)
+}
+
+export async function fetchCurrentDriver(): Promise<Driver | null> {
+  try {
+    const response = await apiFetch<{ driver: RawDriver }>("/api/auth/me")
+    return mapDriver(response.driver)
+  } catch {
+    return null
+  }
+}
+
 export async function fetchDriverContacts(driverId: string): Promise<BrokerContact[]> {
   const raw = await apiFetch<RawContact[]>(`/api/drivers/${driverId}/contacts`)
   return (raw || []).map(mapContact)
 }
 
-export async function fetchLegs(options?: { status?: string; loadId?: string }): Promise<Leg[]> {
+export async function fetchLegs(options?: { status?: string; loadId?: string; driverId?: string }): Promise<Leg[]> {
   const params = new URLSearchParams()
   if (options?.status) params.set("status", options.status)
   if (options?.loadId) params.set("loadId", options.loadId)
+  if (options?.driverId) params.set("driverId", options.driverId)
   const query = params.toString()
   const driverNames = await fetchDriverNames()
   const rawLegs = await apiFetch<RawLeg[]>(`/api/legs${query ? `?${query}` : ""}`)
@@ -363,11 +594,73 @@ export async function submitLoadByLabel(originInput: string, destinationInput: s
   return mapLoad(response.load, response.legs || [], driverNames)
 }
 
-export async function acceptLeg(legId: string, driverId: string): Promise<void> {
-  await apiFetch(`/api/legs/${legId}/accept`, {
+export async function acceptLeg(legId: string, driverId: string): Promise<{ leg: Leg; workflow: LegWorkflow }> {
+  const response = await apiFetch<{ leg: RawLeg; workflow: RawLegWorkflow }>(`/api/legs/${legId}/accept`, {
     method: "POST",
     body: JSON.stringify({ driverId }),
   })
+  const driverNames = await fetchDriverNames()
+  return {
+    leg: mapLeg(response.leg, driverNames),
+    workflow: mapWorkflow(response.workflow, driverNames),
+  }
+}
+
+export async function startLegRoute(legId: string, driverId: string): Promise<{ leg: Leg; workflow: LegWorkflow }> {
+  const response = await apiFetch<{ leg: RawLeg; workflow: RawLegWorkflow }>(`/api/legs/${legId}/start-route`, {
+    method: "POST",
+    body: JSON.stringify({ driverId }),
+  })
+  const driverNames = await fetchDriverNames()
+  return {
+    leg: mapLeg(response.leg, driverNames),
+    workflow: mapWorkflow(response.workflow, driverNames),
+  }
+}
+
+export async function arriveAtLegStop(legId: string, driverId: string): Promise<{ leg: Leg; workflow: LegWorkflow }> {
+  const response = await apiFetch<{ leg: RawLeg; workflow: RawLegWorkflow }>(`/api/legs/${legId}/arrive`, {
+    method: "POST",
+    body: JSON.stringify({ driverId }),
+  })
+  const driverNames = await fetchDriverNames()
+  return {
+    leg: mapLeg(response.leg, driverNames),
+    workflow: mapWorkflow(response.workflow, driverNames),
+  }
+}
+
+export async function finishLegHandoff(
+  legId: string,
+  driverId: string
+): Promise<{ leg: Leg; workflow: LegWorkflow; autoStartedNextLeg?: Leg | null }> {
+  const response = await apiFetch<{ leg: RawLeg; workflow: RawLegWorkflow; autoStartedNextLeg?: RawLeg | null }>(
+    `/api/legs/${legId}/handoff`,
+    {
+      method: "POST",
+      body: JSON.stringify({ driverId }),
+    }
+  )
+  const driverNames = await fetchDriverNames()
+  return {
+    leg: mapLeg(response.leg, driverNames),
+    workflow: mapWorkflow(response.workflow, driverNames),
+    autoStartedNextLeg: response.autoStartedNextLeg ? mapLeg(response.autoStartedNextLeg, driverNames) : null,
+  }
+}
+
+export async function fetchLegWorkflow(legId: string): Promise<LegWorkflow> {
+  const response = await apiFetch<{ leg: RawLeg; workflow: RawLegWorkflow }>(`/api/legs/${legId}/workflow`)
+  const driverNames = await fetchDriverNames()
+  return mapWorkflow(response.workflow, driverNames)
+}
+
+export async function fetchLegDirections(legId: string, driverId?: string): Promise<LegDirections> {
+  const params = new URLSearchParams()
+  if (driverId) params.set("driverId", driverId)
+  const query = params.toString()
+  const response = await apiFetch<RawDirections>(`/api/legs/${legId}/directions${query ? `?${query}` : ""}`)
+  return mapDirections(response)
 }
 
 export function legsToNearbyLoads(legs: Leg[]): NearbyLoad[] {
