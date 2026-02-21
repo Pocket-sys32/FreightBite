@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>FreightBite – Test client</title>
+  <script src="https://cdn.socket.io/4.8.0/socket.io.min.js"></script>
+</head>
+<body>
+  <h1>FreightBite test client</h1>
+  <p>Status: <span id="status">connecting…</span></p>
+  <pre id="last-order">(no order yet – run: npm run push-order)</pre>
+  <script>
+    const socket = io(window.location.origin);
+    socket.on('connect', () => { document.getElementById('status').textContent = 'connected'; });
+    socket.on('disconnect', () => { document.getElementById('status').textContent = 'disconnected'; });
+    socket.on('order', (order) => {
+      document.getElementById('last-order').textContent = JSON.stringify(order, null, 2);
+    });
+  </script>
+</body>
+</html>
