@@ -7,9 +7,58 @@ const { Server } = require('socket.io');
 const { createClient } = require('@supabase/supabase-js');
 const { segmentLoad } = require('./services/segmentLoad');
 
+// Route modules
+const documentsRouter = require('./routes/documents');
+const ratesRouter = require('./routes/rates');
+const companiesRouter = require('./routes/companies');
+
+// AI modules
+const { generateMatchExplanation } = require('./lib/ai/match-explanation');
+const { draftBrokerEmail } = require('./lib/ai/email-drafter');
+const { getRecommendation } = require('./lib/ai/whats-next');
+
 const app = express();
 app.use(express.json());
 app.use(express.static('public'));
+
+// API routes
+app.use('/api/documents', documentsRouter);
+app.use('/api/rates', ratesRouter);
+app.use('/api/companies', companiesRouter);
+
+// AI dispatcher endpoints
+app.post('/api/ai/match-explanation', async (req, res) => {
+  try {
+    const { leg, driver } = req.body;
+    if (!leg || !driver) return res.status(400).json({ error: 'leg and driver are required' });
+    const explanation = await generateMatchExplanation({ leg, driver });
+    res.json({ explanation });
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/ai/draft-email', async (req, res) => {
+  try {
+    const { driver, broker } = req.body;
+    if (!driver || !broker) return res.status(400).json({ error: 'driver and broker are required' });
+    const email = await draftBrokerEmail({ driver, broker });
+    res.json(email);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/ai/whats-next', async (req, res) => {
+  try {
+    const { driver, nearbyLoads } = req.body;
+    if (!driver) return res.status(400).json({ error: 'driver is required' });
+    const recommendation = await getRecommendation({ driver, nearbyLoads: nearbyLoads || [] });
+    res.json(recommendation);
+  } catch (err) {
+    res.status(500).json({ error: err.message });
+  }
+});
 
 const server = http.createServer(app);
 const io = new Server(server, {

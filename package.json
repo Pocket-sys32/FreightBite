@@ -8,8 +8,9 @@
     "push-order": "node scripts/push-order.js"
   },
   "dependencies": {
-    "@supabase/supabase-js": "^2.47.0",
-    "dotenv": "^16.4.5",
+    "@anthropic-ai/sdk": "^0.78.0",
+    "@supabase/supabase-js": "^2.97.0",
+    "dotenv": "^17.3.1",
     "express": "^4.21.0",
     "socket.io": "^4.8.0"
   }
