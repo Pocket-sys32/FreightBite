@@ -184,15 +184,98 @@ async function createLegs(legs) {
   return db.all(`SELECT * FROM legs WHERE id IN (${placeholders})`, ids);
 }
 
+async function createDriver(driver) {
+  const payload = {
+    name: driver.name,
+    email: driver.email,
+    current_lat: driver.current_lat ?? null,
+    current_lng: driver.current_lng ?? null,
+    hos_remaining_hours: driver.hos_remaining_hours ?? null,
+    home_lat: driver.home_lat ?? null,
+    home_lng: driver.home_lng ?? null
+  };
+
+  if (useSupabase) {
+    const { data, error } = await supabase
+      .from('drivers')
+      .insert(payload)
+      .select('*')
+      .single();
+
+    if (error) {
+      throw error;
+    }
+
+    return data;
+  }
+
+  const db = await getSqliteDb();
+  const id = driver.id || crypto.randomUUID();
+  await db.run(
+    `INSERT INTO drivers
+    (id, name, email, current_lat, current_lng, hos_remaining_hours, home_lat, home_lng)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+    [
+      id,
+      payload.name,
+      payload.email,
+      payload.current_lat,
+      payload.current_lng,
+      payload.hos_remaining_hours,
+      payload.home_lat,
+      payload.home_lng
+    ]
+  );
+
+  return db.get('SELECT * FROM drivers WHERE id = ?', [id]);
+}
+
+async function createContact(contact) {
+  const payload = {
+    driver_id: contact.driver_id,
+    broker_name: contact.broker_name,
+    broker_email: contact.broker_email,
+    last_worked_together: contact.last_worked_together ?? null
+  };
+
+  if (useSupabase) {
+    const { data, error } = await supabase
+      .from('contacts')
+      .insert(payload)
+      .select('*')
+      .single();
+
+    if (error) {
+      throw error;
+    }
+
+    return data;
+  }
+
+  const db = await getSqliteDb();
+  const id = contact.id || crypto.randomUUID();
+  await db.run(
+    `INSERT INTO contacts
+    (id, driver_id, broker_name, broker_email, last_worked_together)
+    VALUES (?, ?, ?, ?, ?)`,
+    [id, payload.driver_id, payload.broker_name, payload.broker_email, payload.last_worked_together]
+  );
+
+  return db.get('SELECT * FROM contacts WHERE id = ?', [id]);
+}
+
 async function getLoadById(id) {
   if (useSupabase) {
     const { data, error } = await supabase
       .from('loads')
       .select('*')
       .eq('id', id)
-      .single();
+      .maybeSingle();
 
     if (error) {
+      if (error.code === 'PGRST116') {
+        return null;
+      }
       throw error;
     }
 
@@ -209,9 +292,12 @@ async function getLegById(id) {
       .from('legs')
       .select('*')
       .eq('id', id)
-      .single();
+      .maybeSingle();
 
     if (error) {
+      if (error.code === 'PGRST116') {
+        return null;
+      }
       throw error;
     }
 
@@ -254,6 +340,161 @@ async function updateLegStatus(id, status, driverId) {
   }
 
   return db.get('SELECT * FROM legs WHERE id = ?', [id]);
+}
+
+async function listLoads({ status, limit = 50 } = {}) {
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 50, 200));
+
+  if (useSupabase) {
+    let query = supabase
+      .from('loads')
+      .select('*')
+      .order('created_at', { ascending: false })
+      .limit(safeLimit);
+
+    if (status) {
+      query = query.eq('status', status);
+    }
+
+    const { data, error } = await query;
+    if (error) {
+      throw error;
+    }
+
+    return data || [];
+  }
+
+  const db = await getSqliteDb();
+  const params = [];
+  let sql = 'SELECT * FROM loads';
+
+  if (status) {
+    sql += ' WHERE status = ?';
+    params.push(status);
+  }
+
+  sql += ' ORDER BY datetime(created_at) DESC LIMIT ?';
+  params.push(safeLimit);
+  return db.all(sql, params);
+}
+
+async function listLegs({ status, loadId, limit = 100 } = {}) {
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 100, 500));
+
+  if (useSupabase) {
+    let query = supabase
+      .from('legs')
+      .select('*')
+      .order('sequence', { ascending: true })
+      .limit(safeLimit);
+
+    if (status) {
+      query = query.eq('status', status);
+    }
+
+    if (loadId) {
+      query = query.eq('load_id', loadId);
+    }
+
+    const { data, error } = await query;
+    if (error) {
+      throw error;
+    }
+
+    return data || [];
+  }
+
+  const db = await getSqliteDb();
+  const clauses = [];
+  const params = [];
+
+  if (status) {
+    clauses.push('status = ?');
+    params.push(status);
+  }
+
+  if (loadId) {
+    clauses.push('load_id = ?');
+    params.push(loadId);
+  }
+
+  let sql = 'SELECT * FROM legs';
+  if (clauses.length > 0) {
+    sql += ` WHERE ${clauses.join(' AND ')}`;
+  }
+
+  sql += ' ORDER BY sequence ASC LIMIT ?';
+  params.push(safeLimit);
+  return db.all(sql, params);
+}
+
+async function listLegsByLoad(loadId) {
+  return listLegs({ loadId, limit: 500 });
+}
+
+async function listDrivers({ limit = 50 } = {}) {
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 50, 200));
+
+  if (useSupabase) {
+    const { data, error } = await supabase
+      .from('drivers')
+      .select('*')
+      .order('name', { ascending: true })
+      .limit(safeLimit);
+
+    if (error) {
+      throw error;
+    }
+
+    return data || [];
+  }
+
+  const db = await getSqliteDb();
+  return db.all('SELECT * FROM drivers ORDER BY name ASC LIMIT ?', [safeLimit]);
+}
+
+async function getDriverById(id) {
+  if (useSupabase) {
+    const { data, error } = await supabase
+      .from('drivers')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return null;
+      }
+      throw error;
+    }
+
+    return data;
+  }
+
+  const db = await getSqliteDb();
+  return db.get('SELECT * FROM drivers WHERE id = ?', [id]);
+}
+
+async function getContactById(id) {
+  if (useSupabase) {
+    const { data, error } = await supabase
+      .from('contacts')
+      .select('*')
+      .eq('id', id)
+      .maybeSingle();
+
+    if (error) {
+      if (error.code === 'PGRST116') {
+        return null;
+      }
+      throw error;
+    }
+
+    return data;
+  }
+
+  const db = await getSqliteDb();
+  return db.get('SELECT * FROM contacts WHERE id = ?', [id]);
 }
 
 async function listOpenLegsNear(lat, lng, hosHours) {
@@ -303,9 +544,17 @@ async function listContactsByDriver(driverId) {
 module.exports = {
   createLoad,
   createLegs,
+  createDriver,
+  createContact,
   getLoadById,
   getLegById,
+  listLoads,
+  listLegs,
+  listLegsByLoad,
   updateLegStatus,
+  listDrivers,
+  getDriverById,
+  getContactById,
   listOpenLegsNear,
   listContactsByDriver
 };

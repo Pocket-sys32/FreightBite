@@ -5,7 +5,6 @@ const express = require('express');
 const http = require('http');
 const { EventEmitter } = require('events');
 const { Server } = require('socket.io');
-const { createClient } = require('@supabase/supabase-js');
 const db = require('./server/db');
 const { segmentLoad } = require('./server/segmentLoad');
 
@@ -21,6 +20,15 @@ const { getRecommendation } = require('./lib/ai/whats-next');
 
 const app = express();
 app.use(express.json());
+app.use((req, res, next) => {
+  res.header('Access-Control-Allow-Origin', '*');
+  res.header('Access-Control-Allow-Methods', 'GET,POST,PATCH,DELETE,OPTIONS');
+  res.header('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') {
+    return res.sendStatus(204);
+  }
+  return next();
+});
 app.use(express.static('public'));
 
 // API routes
@@ -70,22 +78,21 @@ const io = new Server(server, {
 const PORT = process.env.PORT || 3000;
 const legEvents = new EventEmitter();
 
-function emitLegCompleted(leg) {
+function emitLegUpdate(leg) {
   const payload = {
     legId: leg.id,
+    loadId: leg.load_id || null,
     driverId: leg.driver_id || null,
-    status: leg.status
+    status: leg.status,
+    updatedAt: new Date().toISOString()
   };
 
-  legEvents.emit('leg.completed', payload);
-  io.emit('leg.completed', payload);
+  legEvents.emit('leg.update', payload);
+  io.emit('leg:update', payload);
+  if (leg.status === 'COMPLETE') {
+    io.emit('leg.completed', payload);
+  }
 }
-
-const supabaseUrl = process.env.NEXT_PUBLIC_SUPABASE_URL || process.env.SUPABASE_URL;
-const supabaseAnonKey = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY || process.env.SUPABASE_ANON_KEY;
-const supabase = supabaseUrl && supabaseAnonKey
-  ? createClient(supabaseUrl, supabaseAnonKey)
-  : null;
 
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
@@ -144,31 +151,92 @@ app.post('/push-order', async (req, res) => {
 
 /** GET /api/loads — list loads (optional ?status=) */
 app.get('/api/loads', async (req, res) => {
-  if (!supabase) return res.status(503).json({ error: 'Supabase not configured' });
-  let q = supabase.from('loads').select('*').order('created_at', { ascending: false });
-  if (req.query.status) q = q.eq('status', req.query.status);
-  const { data, error } = await q.limit(50);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
+  try {
+    const status = req.query.status ? normalizeStatus(req.query.status) : null;
+    if (req.query.status && !status) {
+      return res.status(400).json({ error: 'Invalid status filter' });
+    }
+
+    const loads = await db.listLoads({ status, limit: req.query.limit });
+    return res.json((loads || []).map(hydrateLoad));
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to list loads' });
+  }
 });
 
 /** GET /api/loads/:id — load with legs */
 app.get('/api/loads/:id', async (req, res) => {
-  if (!supabase) return res.status(503).json({ error: 'Supabase not configured' });
-  const { data: load, error: loadErr } = await supabase.from('loads').select('*').eq('id', req.params.id).single();
-  if (loadErr || !load) return res.status(404).json({ error: 'Load not found' });
-  const { data: legs } = await supabase.from('legs').select('*').eq('load_id', load.id).order('sequence');
-  res.json({ ...load, legs: legs || [] });
+  try {
+    const load = await db.getLoadById(req.params.id);
+    if (!load) {
+      return res.status(404).json({ error: 'Load not found' });
+    }
+
+    const legs = await db.listLegsByLoad(load.id);
+    return res.json({
+      ...hydrateLoad(load),
+      legs: (legs || []).map(hydrateLeg).sort((a, b) => a.sequence - b.sequence)
+    });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to fetch load' });
+  }
 });
 
 /** GET /api/legs — list legs (e.g. ?status=open for driver) */
 app.get('/api/legs', async (req, res) => {
-  if (!supabase) return res.status(503).json({ error: 'Supabase not configured' });
-  let q = supabase.from('legs').select('*, loads(origin, destination, miles)').order('sequence');
-  if (req.query.status) q = q.eq('status', req.query.status);
-  const { data, error } = await q.limit(100);
-  if (error) return res.status(500).json({ error: error.message });
-  res.json(data || []);
+  try {
+    const status = req.query.status ? normalizeStatus(req.query.status) : null;
+    if (req.query.status && !status) {
+      return res.status(400).json({ error: 'Invalid status filter' });
+    }
+
+    const legs = await db.listLegs({
+      status,
+      loadId: req.query.loadId || req.query.load_id,
+      limit: req.query.limit
+    });
+    return res.json((legs || []).map(hydrateLeg));
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to list legs' });
+  }
+});
+
+/** GET /api/drivers — list drivers */
+app.get('/api/drivers', async (req, res) => {
+  try {
+    const drivers = await db.listDrivers({ limit: req.query.limit });
+    return res.json(drivers || []);
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to list drivers' });
+  }
+});
+
+/** GET /api/drivers/:id — get one driver */
+app.get('/api/drivers/:id', async (req, res) => {
+  try {
+    const driver = await db.getDriverById(req.params.id);
+    if (!driver) {
+      return res.status(404).json({ error: 'Driver not found' });
+    }
+    return res.json(driver);
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to fetch driver' });
+  }
+});
+
+/** GET /api/drivers/:id/contacts — list contacts for driver */
+app.get('/api/drivers/:id/contacts', async (req, res) => {
+  try {
+    const driver = await db.getDriverById(req.params.id);
+    if (!driver) {
+      return res.status(404).json({ error: 'Driver not found' });
+    }
+
+    const contacts = await db.listContactsByDriver(req.params.id);
+    return res.json(contacts || []);
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to list contacts' });
+  }
 });
 
 const isValidLocation = (location) =>
@@ -201,6 +269,20 @@ const hydrateLeg = (leg) => ({
   handoff_point: safeParseJson(leg.handoff_point)
 });
 
+const VALID_STATUSES = new Set(['OPEN', 'IN_TRANSIT', 'COMPLETE']);
+const normalizeStatus = (value) => {
+  if (!value || typeof value !== 'string') {
+    return null;
+  }
+
+  const upper = value.toUpperCase();
+  if (upper === 'COMPLETED') {
+    return 'COMPLETE';
+  }
+
+  return VALID_STATUSES.has(upper) ? upper : null;
+};
+
 /** POST /api/loads/submit — submit a load and segment into relay legs */
 app.post('/api/loads/submit', async (req, res) => {
   const { origin, destination } = req.body || {};
@@ -232,9 +314,11 @@ app.post('/api/loads/submit', async (req, res) => {
       }))
     );
 
+    const orderedLegs = (legRecords || []).sort((a, b) => a.sequence - b.sequence);
+
     return res.json({
       load: hydrateLoad(loadRecord),
-      legs: legRecords.map(hydrateLeg)
+      legs: orderedLegs.map(hydrateLeg)
     });
   } catch (error) {
     const status = error.statusCode || 500;
@@ -262,7 +346,8 @@ app.post('/api/legs/:id/accept', async (req, res) => {
     }
 
     const updatedLeg = await db.updateLegStatus(legId, 'IN_TRANSIT', driverId);
-    return res.json(updatedLeg);
+    emitLegUpdate(updatedLeg);
+    return res.json(hydrateLeg(updatedLeg));
   } catch (error) {
     return res.status(500).json({ error: 'Failed to accept leg', details: error.message });
   }
@@ -292,19 +377,52 @@ app.post('/api/legs/:id/complete', async (req, res) => {
     }
 
     const updatedLeg = await db.updateLegStatus(legId, 'COMPLETE');
-    emitLegCompleted(updatedLeg);
-    return res.json(updatedLeg);
+    emitLegUpdate(updatedLeg);
+    return res.json(hydrateLeg(updatedLeg));
   } catch (error) {
     return res.status(500).json({ error: 'Failed to complete leg', details: error.message });
   }
 });
 
-legEvents.on('leg.completed', (payload) => {
-  console.log('Leg completed event:', payload.legId);
+legEvents.on('leg.update', (payload) => {
+  console.log('Leg update event:', payload.legId, payload.status);
 });
+
+async function ensureDemoData() {
+  try {
+    const existingDrivers = await db.listDrivers({ limit: 1 });
+    if (existingDrivers.length > 0) {
+      return;
+    }
+
+    const demoDriver = await db.createDriver({
+      id: 'drv_demo_1',
+      name: 'Alex Rivera',
+      email: 'alex.rivera@example.com',
+      current_lat: 41.8781,
+      current_lng: -87.6298,
+      hos_remaining_hours: 8.5,
+      home_lat: 39.7392,
+      home_lng: -104.9903
+    });
+
+    await db.createContact({
+      id: 'contact_demo_1',
+      driver_id: demoDriver.id,
+      broker_name: 'Midwest Freight Co',
+      broker_email: 'dispatch@midwestfreight.example',
+      last_worked_together: '2026-01-15'
+    });
+
+    console.log('Seeded demo driver/contact for local development');
+  } catch (error) {
+    console.error('Failed to seed demo data:', error.message);
+  }
+}
 
 server.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
   console.log('Socket.io ready for mobile clients');
   console.log(`Trigger push: POST http://localhost:${PORT}/push-order or run: npm run push-order`);
+  void ensureDemoData();
 });
