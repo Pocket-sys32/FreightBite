@@ -5,6 +5,7 @@ CREATE TABLE IF NOT EXISTS loads (
   origin text NOT NULL,
   destination text NOT NULL,
   miles numeric NOT NULL,
+  contract_total_payout_cents bigint,
   status text NOT NULL CHECK (status IN ('OPEN','IN_TRANSIT','COMPLETE')),
   created_at timestamptz NOT NULL DEFAULT now()
 );
@@ -29,6 +30,7 @@ CREATE TABLE IF NOT EXISTS legs (
   miles numeric NOT NULL,
   handoff_point text,
   rate_cents int NOT NULL,
+  payout_per_mile_cents int,
   status text NOT NULL CHECK (status IN ('OPEN','IN_TRANSIT','COMPLETE')),
   driver_id uuid REFERENCES drivers(id) ON DELETE SET NULL
 );

@@ -16,6 +16,7 @@ const db = require('./server/db');
 const { segmentLoad } = require('./server/segmentLoad');
 const { haversineMiles, metersToMiles } = require('./server/geo');
 const { supabase, supabaseAdmin } = require('./lib/supabase');
+const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
 
 // Route modules
 const documentsRouter = require('./routes/documents');
@@ -26,6 +27,7 @@ const companiesRouter = require('./routes/companies');
 const { generateMatchExplanation } = require('./lib/ai/match-explanation');
 const { draftBrokerEmail } = require('./lib/ai/email-drafter');
 const { getRecommendation } = require('./lib/ai/whats-next');
+const { answerOutreachQuestion } = require('./lib/ai/outreach-chat');
 
 const app = express();
 app.use(express.json({ limit: '25mb' }));
@@ -414,6 +416,8 @@ app.post('/api/auth/register-driver', async (req, res) => {
       password_hash: passwordHash
     });
 
+    await ensureStarterContactsForDriver(driver.id);
+
     const token = signDriverToken(driver.id);
     return res.status(201).json({ token, driver });
   } catch (error) {
@@ -443,6 +447,8 @@ app.post('/api/auth/login-driver', async (req, res) => {
       return res.status(401).json({ error: 'invalid credentials' });
     }
 
+    await ensureStarterContactsForDriver(driver.id);
+
     const token = signDriverToken(driver.id);
     return res.json({ token, driver });
   } catch (error) {
@@ -457,6 +463,38 @@ app.get('/api/auth/me', async (req, res) => {
   }
   return res.json({ driver });
 });
+
+async function ensureStarterContactsForDriver(driverId) {
+  const currentContacts = await db.listContactsByDriver(driverId);
+  if (Array.isArray(currentContacts) && currentContacts.length > 0) {
+    return;
+  }
+
+  const starters = [
+    {
+      broker_name: 'TQL - Midwest Desk',
+      broker_email: 'midwest@tql-demo.com',
+      last_worked_together: '2026-01-18',
+    },
+    {
+      broker_name: 'C.H. Robinson - Dry Van',
+      broker_email: 'relay@chrobinson-demo.com',
+      last_worked_together: '2026-02-02',
+    },
+    {
+      broker_name: 'Echo Logistics - Spot Team',
+      broker_email: 'spot@echolog-demo.com',
+      last_worked_together: '2026-02-14',
+    },
+  ];
+
+  for (const contact of starters) {
+    await db.createContact({
+      driver_id: driverId,
+      ...contact,
+    });
+  }
+}
 
 app.post('/api/auth/oauth-session', async (req, res) => {
   const { email, name, currentLat, currentLng, homeLat, homeLng } = req.body || {};
@@ -477,6 +515,8 @@ app.post('/api/auth/oauth-session', async (req, res) => {
         home_lng: typeof homeLng === 'number' ? homeLng : null
       });
     }
+
+    await ensureStarterContactsForDriver(driver.id);
 
     const token = signDriverToken(driver.id);
     return res.json({ token, driver });
@@ -504,6 +544,37 @@ app.post('/api/ai/draft-email', async (req, res) => {
     res.json(email);
   } catch (err) {
     res.status(500).json({ error: err.message });
+  }
+});
+
+app.post('/api/ai/outreach-chat', async (req, res) => {
+  try {
+    const { question, contacts, gapLeg, driver } = req.body || {};
+    if (!question || String(question).trim().length < 3) {
+      return res.status(400).json({ error: 'question is required' });
+    }
+
+    try {
+      const answer = await answerOutreachQuestion({
+        question: String(question).trim(),
+        contacts: Array.isArray(contacts) ? contacts : [],
+        gapLeg: gapLeg || null,
+        driver: driver || null,
+      });
+      return res.json({ answer });
+    } catch (aiError) {
+      const contactList = Array.isArray(contacts) ? contacts : [];
+      const ranked = [...contactList]
+        .sort((a, b) => Number(b?.avgRatePerMile || 0) - Number(a?.avgRatePerMile || 0))
+        .slice(0, 3);
+      const fallback = ranked.length
+        ? `Top contacts right now: ${ranked.map((c) => `${c.name} (${c.company})`).join(', ')}. Reach out with lane + pickup window + equipment and ask for same-day coverage.`
+        : 'No contacts available yet. Upload outreach docs or add broker contacts, then ask again.';
+
+      return res.json({ answer: fallback, fallback: true, details: aiError.message || 'AI unavailable' });
+    }
+  } catch (err) {
+    return res.status(500).json({ error: err.message || 'Failed to answer outreach question' });
   }
 });
 
@@ -930,6 +1001,84 @@ const buildDirectionsUrl = (fromPoint, toPoint) =>
   `http://router.project-osrm.org/route/v1/driving/${fromPoint.lng},${fromPoint.lat};${toPoint.lng},${toPoint.lat}?overview=full&steps=true&geometries=geojson`;
 
 async function fetchDirections(fromPoint, toPoint) {
+  if (GOOGLE_MAPS_API_KEY) {
+    const params = new URLSearchParams({
+      origin: `${fromPoint.lat},${fromPoint.lng}`,
+      destination: `${toPoint.lat},${toPoint.lng}`,
+      mode: 'driving',
+      alternatives: 'false',
+      key: GOOGLE_MAPS_API_KEY
+    });
+    const response = await fetch(`https://maps.googleapis.com/maps/api/directions/json?${params.toString()}`);
+    if (!response.ok) {
+      throw new Error(`Google directions request failed (${response.status})`);
+    }
+
+    const payload = await response.json();
+    const route = payload?.routes?.[0];
+    if (payload?.status !== 'OK' || !route) {
+      throw new Error(payload?.error_message || payload?.status || 'Google returned no route for directions');
+    }
+
+    const routeLegs = Array.isArray(route.legs) ? route.legs : [];
+    const totalMeters = routeLegs.reduce((sum, leg) => sum + Number(leg?.distance?.value || 0), 0);
+    const totalSeconds = routeLegs.reduce((sum, leg) => sum + Number(leg?.duration?.value || 0), 0);
+    const decodedGeometry = route?.overview_polyline?.points
+      ? (() => {
+          const encoded = route.overview_polyline.points;
+          const out = [];
+          let index = 0;
+          let lat = 0;
+          let lng = 0;
+          while (index < encoded.length) {
+            let shift = 0;
+            let result = 0;
+            let byte;
+            do {
+              byte = encoded.charCodeAt(index++) - 63;
+              result |= (byte & 0x1f) << shift;
+              shift += 5;
+            } while (byte >= 0x20);
+            lat += (result & 1) ? ~(result >> 1) : (result >> 1);
+
+            shift = 0;
+            result = 0;
+            do {
+              byte = encoded.charCodeAt(index++) - 63;
+              result |= (byte & 0x1f) << shift;
+              shift += 5;
+            } while (byte >= 0x20);
+            lng += (result & 1) ? ~(result >> 1) : (result >> 1);
+            out.push([lng / 1e5, lat / 1e5]);
+          }
+          return out;
+        })()
+      : [];
+
+    const steps = [];
+    for (const leg of routeLegs) {
+      for (const step of leg.steps || []) {
+        steps.push({
+          distanceMiles: Number(metersToMiles(step?.distance?.value || 0).toFixed(2)),
+          durationMinutes: Number(((step?.duration?.value || 0) / 60).toFixed(1)),
+          name: step?.html_instructions?.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim() || '',
+          maneuver: step?.maneuver || 'turn',
+          instruction: step?.html_instructions?.replace(/<[^>]*>/g, ' ').replace(/\s+/g, ' ').trim() || 'Continue',
+          location: step?.start_location
+            ? { lat: step.start_location.lat, lng: step.start_location.lng }
+            : null
+        });
+      }
+    }
+
+    return {
+      distanceMiles: Number(metersToMiles(totalMeters).toFixed(2)),
+      durationMinutes: Number((totalSeconds / 60).toFixed(1)),
+      geometry: decodedGeometry,
+      steps
+    };
+  }
+
   const response = await fetch(buildDirectionsUrl(fromPoint, toPoint));
   if (!response.ok) {
     throw new Error(`OSRM directions request failed (${response.status})`);
@@ -1010,30 +1159,57 @@ const normalizeStatus = (value) => {
 
 /** POST /api/loads/submit — submit a load and segment into relay legs */
 app.post('/api/loads/submit', async (req, res) => {
-  const { origin, destination } = req.body || {};
+  const { origin, destination, totalContractPrice } = req.body || {};
 
   if (!isValidLocation(origin) || !isValidLocation(destination)) {
     return res.status(400).json({ error: 'origin and destination with lat/lng are required.' });
   }
+  const totalContractPriceNumber = Number(totalContractPrice);
+  if (!Number.isFinite(totalContractPriceNumber) || totalContractPriceNumber <= 0) {
+    return res.status(400).json({ error: 'totalContractPrice must be a positive number.' });
+  }
 
   try {
     const { totalMiles, legs } = await segmentLoad(origin, destination);
+    const totalContractCents = Math.round(totalContractPriceNumber * 100);
+    const safeTotalMiles = legs.reduce((sum, leg) => sum + Number(leg.miles || 0), 0);
+
+    const rateCentsByLeg = [];
+    let assignedCents = 0;
+    for (let index = 0; index < legs.length; index += 1) {
+      const isLast = index === legs.length - 1;
+      if (isLast) {
+        rateCentsByLeg.push(Math.max(0, totalContractCents - assignedCents));
+        break;
+      }
+      const share = safeTotalMiles > 0
+        ? Math.round(totalContractCents * (Number(legs[index].miles || 0) / safeTotalMiles))
+        : Math.round(totalContractCents / Math.max(legs.length, 1));
+      const boundedShare = Math.max(0, share);
+      rateCentsByLeg.push(boundedShare);
+      assignedCents += boundedShare;
+    }
+
     const loadRecord = await db.createLoad({
       origin: JSON.stringify(origin),
       destination: JSON.stringify(destination),
       miles: totalMiles,
+      contract_total_payout_cents: totalContractCents,
       status: 'OPEN'
     });
 
     const legRecords = await db.createLegs(
-      legs.map((leg) => ({
+      legs.map((leg, index) => ({
         load_id: loadRecord.id,
         sequence: leg.sequence,
         origin: JSON.stringify(leg.origin),
         destination: JSON.stringify(leg.destination),
         miles: leg.miles,
         handoff_point: JSON.stringify(leg.handoff_point),
-        rate_cents: 0,
+        rate_cents: rateCentsByLeg[index] ?? 0,
+        payout_per_mile_cents: Number(leg.miles) > 0
+          ? Math.round((rateCentsByLeg[index] ?? 0) / Number(leg.miles))
+          : 0,
         status: leg.status,
         driver_id: null,
         origin_address: leg.origin_address || null,

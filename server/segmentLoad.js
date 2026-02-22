@@ -1,11 +1,111 @@
 const { TRUCK_STOPS } = require('./truckStops');
 const { haversineMeters, metersToMiles, roundMiles, reverseGeocode } = require('./geo');
+const GOOGLE_MAPS_API_KEY = process.env.GOOGLE_MAPS_API_KEY || process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
 
 const buildOsrmUrl = (origin, destination) => {
   const originPart = `${origin.lng},${origin.lat}`;
   const destinationPart = `${destination.lng},${destination.lat}`;
   return `http://router.project-osrm.org/route/v1/driving/${originPart};${destinationPart}?overview=full&steps=true&geometries=geojson`;
 };
+
+const decodePolyline = (encoded) => {
+  const points = [];
+  let index = 0;
+  let lat = 0;
+  let lng = 0;
+
+  while (index < encoded.length) {
+    let shift = 0;
+    let result = 0;
+    let byte;
+    do {
+      byte = encoded.charCodeAt(index++) - 63;
+      result |= (byte & 0x1f) << shift;
+      shift += 5;
+    } while (byte >= 0x20);
+    const dLat = (result & 1) ? ~(result >> 1) : (result >> 1);
+    lat += dLat;
+
+    shift = 0;
+    result = 0;
+    do {
+      byte = encoded.charCodeAt(index++) - 63;
+      result |= (byte & 0x1f) << shift;
+      shift += 5;
+    } while (byte >= 0x20);
+    const dLng = (result & 1) ? ~(result >> 1) : (result >> 1);
+    lng += dLng;
+
+    points.push([lng / 1e5, lat / 1e5]); // [lng, lat]
+  }
+
+  return points;
+};
+
+async function fetchRouteGeometry(origin, destination) {
+  if (GOOGLE_MAPS_API_KEY) {
+    const params = new URLSearchParams({
+      origin: `${origin.lat},${origin.lng}`,
+      destination: `${destination.lat},${destination.lng}`,
+      mode: 'driving',
+      alternatives: 'false',
+      key: GOOGLE_MAPS_API_KEY
+    });
+    const response = await fetch(`https://maps.googleapis.com/maps/api/directions/json?${params.toString()}`);
+    if (!response.ok) {
+      const error = new Error(`Google Directions request failed with status ${response.status}.`);
+      error.statusCode = response.status >= 500 ? 502 : 400;
+      throw error;
+    }
+    const payload = await response.json();
+    const route = payload?.routes?.[0];
+    if (payload?.status !== 'OK' || !route) {
+      const error = new Error(payload?.error_message || payload?.status || 'Google Directions returned no route.');
+      error.statusCode = 502;
+      throw error;
+    }
+    const meters = (route.legs || []).reduce((sum, leg) => sum + Number(leg?.distance?.value || 0), 0);
+    const encoded = route?.overview_polyline?.points || '';
+    const coordinates = decodePolyline(encoded);
+    if (!Array.isArray(coordinates) || coordinates.length < 2) {
+      const error = new Error('Google Directions route geometry was invalid.');
+      error.statusCode = 502;
+      throw error;
+    }
+
+    return {
+      totalMiles: metersToMiles(meters),
+      coordinates
+    };
+  }
+
+  const response = await fetch(buildOsrmUrl(origin, destination));
+  if (!response.ok) {
+    const error = new Error(`OSRM request failed with status ${response.status}.`);
+    error.statusCode = response.status >= 500 ? 502 : 400;
+    throw error;
+  }
+
+  const data = await response.json();
+  if (!data.routes || !data.routes[0] || !data.routes[0].geometry) {
+    const error = new Error('OSRM returned no route geometry.');
+    error.statusCode = 502;
+    throw error;
+  }
+
+  const route = data.routes[0];
+  const coordinates = route.geometry.coordinates;
+  if (!Array.isArray(coordinates) || coordinates.length < 2) {
+    const error = new Error('OSRM route geometry was invalid.');
+    error.statusCode = 502;
+    throw error;
+  }
+
+  return {
+    totalMiles: metersToMiles(route.distance),
+    coordinates
+  };
+}
 
 const normalizeLabel = (label, point) => {
   if (label && typeof label === 'string') {
@@ -107,30 +207,10 @@ const segmentLoad = async (origin, destination) => {
     throw error;
   }
 
-  const response = await fetch(buildOsrmUrl(origin, destination));
-  if (!response.ok) {
-    const error = new Error(`OSRM request failed with status ${response.status}.`);
-    error.statusCode = response.status >= 500 ? 502 : 400;
-    throw error;
-  }
-
-  const data = await response.json();
-  if (!data.routes || !data.routes[0] || !data.routes[0].geometry) {
-    const error = new Error('OSRM returned no route geometry.');
-    error.statusCode = 502;
-    throw error;
-  }
-
-  const route = data.routes[0];
-  const totalMiles = metersToMiles(route.distance);
+  const routeData = await fetchRouteGeometry(origin, destination);
+  const totalMiles = routeData.totalMiles;
   const legCount = Math.max(1, Math.ceil(totalMiles / 450));
-  const coordinates = route.geometry.coordinates;
-
-  if (!Array.isArray(coordinates) || coordinates.length < 2) {
-    const error = new Error('OSRM route geometry was invalid.');
-    error.statusCode = 502;
-    throw error;
-  }
+  const coordinates = routeData.coordinates;
 
   const { boundaries, totalDistance } = segmentRouteGeometry(coordinates, legCount);
   const computedTotalMiles = metersToMiles(totalDistance);

@@ -43,6 +43,7 @@ function statusClass(status: string) {
 export default function ShipperPortalPage() {
   const [origin, setOrigin] = useState("2700 S California Ave, Chicago, IL 60608")
   const [destination, setDestination] = useState("8155 Beech Ave, Fontana, CA 92335")
+  const [totalContractPrice, setTotalContractPrice] = useState("4200")
   const [load, setLoad] = useState<Load | null>(null)
   const [loading, setLoading] = useState(false)
   const [bootstrapping, setBootstrapping] = useState(true)
@@ -68,10 +69,16 @@ export default function ShipperPortalPage() {
   }, [loadLatest])
 
   const handleSubmit = async () => {
+    const price = Number(totalContractPrice)
+    if (!Number.isFinite(price) || price <= 0) {
+      setError("Enter a valid total contract price.")
+      return
+    }
+
     setLoading(true)
     setError(null)
     try {
-      const created = await submitLoadByLabel(origin, destination)
+      const created = await submitLoadByLabel(origin, destination, price)
       setLoad(created)
     } catch (submitError) {
       const message = submitError instanceof Error ? submitError.message : "Failed to submit load"
@@ -85,13 +92,14 @@ export default function ShipperPortalPage() {
     if (!load) return null
     const totalRate = load.legs.reduce((sum, leg) => sum + leg.rateCents + leg.fuelSurchargeCents, 0)
     const lineHaulOnly = load.legs.reduce((sum, leg) => sum + leg.rateCents, 0)
+    const contractTotal = typeof load.contractTotalPayoutCents === "number" ? load.contractTotalPayoutCents : lineHaulOnly
     const assignedLegs = load.legs.filter(
       (leg) =>
         leg.status === "ASSIGNED" ||
         leg.status === "IN_TRANSIT" ||
         leg.status === "COMPLETED"
     ).length
-    return { totalRate, lineHaulOnly, assignedLegs }
+    return { totalRate, lineHaulOnly, contractTotal, assignedLegs }
   }, [load])
 
   return (
@@ -147,9 +155,23 @@ export default function ShipperPortalPage() {
               className="h-11 rounded-xl border-border bg-secondary/40 focus:border-primary"
             />
           </div>
+          <div className="w-full sm:w-[180px]">
+            <label className="mb-2 block text-[10px] font-semibold text-muted-foreground uppercase tracking-[0.15em]">
+              Total Contract $
+            </label>
+            <Input
+              type="number"
+              min="1"
+              step="0.01"
+              placeholder="4200"
+              value={totalContractPrice}
+              onChange={(event) => setTotalContractPrice(event.target.value)}
+              className="h-11 rounded-xl border-border bg-secondary/40 focus:border-primary"
+            />
+          </div>
           <Button
             onClick={handleSubmit}
-            disabled={loading || !origin || !destination}
+            disabled={loading || !origin || !destination || !totalContractPrice}
             className="gap-2 h-11 rounded-full px-7 shrink-0 bg-foreground text-background hover:bg-foreground/90"
           >
             {loading ? (
@@ -210,6 +232,12 @@ export default function ShipperPortalPage() {
               },
               {
                 icon: DollarSign,
+                value: `$${(summary.contractTotal / 100).toLocaleString()}`,
+                unit: "",
+                label: "Contract Total",
+              },
+              {
+                icon: DollarSign,
                 value: `$${(summary.totalRate / 100).toLocaleString()}`,
                 unit: "",
                 label: "All-In (w/ FSC)",
@@ -256,7 +284,7 @@ export default function ShipperPortalPage() {
                   <table className="w-full text-sm">
                     <thead>
                       <tr className="border-b border-border">
-                        {["Leg", "Route", "Miles", "Rate", "Driver", "Status"].map((header) => (
+                        {["Leg", "Route", "Miles", "Rate", "Payout/mi", "Driver", "Status"].map((header) => (
                           <th
                             key={header}
                             className="pb-3 pr-4 text-left text-[10px] font-semibold text-muted-foreground uppercase tracking-[0.15em]"
@@ -295,6 +323,9 @@ export default function ShipperPortalPage() {
                             <td className="py-4 pr-4">
                               <span className="font-medium text-foreground">${allIn.toLocaleString()}</span>
                               <p className="text-[10px] text-muted-foreground">${leg.ratePerMile.toFixed(2)}/mi + FSC</p>
+                            </td>
+                            <td className="py-4 pr-4 font-mono text-foreground">
+                              ${leg.ratePerMile.toFixed(2)}
                             </td>
                             <td className="py-4 pr-4">
                               {leg.driverName ? (

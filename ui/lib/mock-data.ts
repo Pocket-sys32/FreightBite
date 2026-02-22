@@ -61,6 +61,7 @@ export interface Load {
   origin: string
   destination: string
   miles: number
+  contractTotalPayoutCents?: number
   status: string
   commodity: string
   weight: number

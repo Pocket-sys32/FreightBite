@@ -57,6 +57,34 @@ interface RelayMarker {
   leg: Leg
 }
 
+function toLatLng(point: any): { lat: number; lng: number } | null {
+  if (!point) return null
+  if (typeof point.lat === "function" && typeof point.lng === "function") {
+    return { lat: point.lat(), lng: point.lng() }
+  }
+  if (typeof point.lat === "number" && typeof point.lng === "number") {
+    return { lat: point.lat, lng: point.lng }
+  }
+  return null
+}
+
+function routePathFromDirections(route: any): Array<{ lat: number; lng: number }> {
+  const steps = (route?.legs || []).flatMap((leg: any) => leg?.steps || [])
+  const points: Array<{ lat: number; lng: number }> = []
+
+  for (const step of steps) {
+    for (const rawPoint of step?.path || []) {
+      const point = toLatLng(rawPoint)
+      if (point) points.push(point)
+    }
+  }
+
+  if (points.length > 1) return points
+
+  const overview = (route?.overview_path || []).map((rawPoint: any) => toLatLng(rawPoint)).filter(Boolean)
+  return overview as Array<{ lat: number; lng: number }>
+}
+
 export function RelayMap({ legs }: RelayMapProps) {
   const mapRef = useRef<any>(null)
   const [routedLegs, setRoutedLegs] = useState<Array<{ leg: Leg; path: Array<{ lat: number; lng: number }>; marker: RelayMarker }>>([])
@@ -96,10 +124,7 @@ export function RelayMap({ legs }: RelayMapProps) {
               travelMode: googleObj.maps.TravelMode.DRIVING,
             })
             const route = response?.routes?.[0]
-            const overviewPath = (route?.overview_path || []).map((point: any) => ({
-              lat: point.lat(),
-              lng: point.lng(),
-            }))
+            const overviewPath = routePathFromDirections(route)
             if (overviewPath.length === 0) continue
 
             const end = route?.legs?.[0]?.end_location

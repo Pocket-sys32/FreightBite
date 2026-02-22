@@ -38,6 +38,7 @@ interface RawLoad {
   origin: RawPoint
   destination: RawPoint
   miles?: number
+  contract_total_payout_cents?: number | null
   status?: string
   created_at?: string
   legs?: RawLeg[]
@@ -52,6 +53,7 @@ interface RawLeg {
   miles?: number
   handoff_point?: RawPoint
   rate_cents?: number
+  payout_per_mile_cents?: number | null
   status?: string
   driver_id?: string | null
   origin_address?: string | null
@@ -342,7 +344,12 @@ function mapLeg(raw: RawLeg, driverNameById: Map<string, string>): Leg {
       ? raw.rate_cents
       : Math.round(miles * 185)
   const fuelSurchargeCents = Math.round(miles * 32)
-  const ratePerMile = miles > 0 ? Number((rateCents / miles / 100).toFixed(2)) : 0
+  const ratePerMile =
+    typeof raw.payout_per_mile_cents === "number" && Number.isFinite(raw.payout_per_mile_cents)
+      ? Number((raw.payout_per_mile_cents / 100).toFixed(2))
+      : miles > 0
+      ? Number((rateCents / miles / 100).toFixed(2))
+      : 0
   const origin = pointLabel(raw.origin, "Origin")
   const destination = pointLabel(raw.destination, "Destination")
   const originCoords = pointCoords(raw.origin)
@@ -456,6 +463,10 @@ function mapLoad(raw: RawLoad, legs: RawLeg[], driverNameById: Map<string, strin
     origin,
     destination,
     miles: Number(totalMiles.toFixed(1)),
+    contractTotalPayoutCents:
+      typeof raw.contract_total_payout_cents === "number" && Number.isFinite(raw.contract_total_payout_cents)
+        ? raw.contract_total_payout_cents
+        : undefined,
     status: raw.status || "OPEN",
     commodity: "General Freight",
     weight: 38000,
@@ -657,14 +668,18 @@ export async function fetchLatestLoad(): Promise<Load | null> {
   return fetchLoadById(loads[0].id)
 }
 
-export async function submitLoadByLabel(originInput: string, destinationInput: string): Promise<Load> {
+export async function submitLoadByLabel(
+  originInput: string,
+  destinationInput: string,
+  totalContractPrice: number
+): Promise<Load> {
   const [origin, destination] = await Promise.all([
     resolveLocation(originInput),
     resolveLocation(destinationInput),
   ])
   const response = await apiFetch<{ load: RawLoad; legs: RawLeg[] }>("/api/loads/submit", {
     method: "POST",
-    body: JSON.stringify({ origin, destination }),
+    body: JSON.stringify({ origin, destination, totalContractPrice }),
   })
 
   const driverNames = await fetchDriverNames()
@@ -836,6 +851,18 @@ export async function draftOutreachEmail(args: {
     subject: response.subject || `Coverage request - ${contact.company}`,
     body: response.body || "No draft returned.",
   }
+}
+
+export async function askOutreachAssistant(args: {
+  question: string
+  contacts: BrokerContact[]
+  gapLeg: Leg | null
+  driver: Driver | null
+}): Promise<{ answer: string; fallback?: boolean; details?: string }> {
+  return apiFetch<{ answer: string; fallback?: boolean; details?: string }>("/api/ai/outreach-chat", {
+    method: "POST",
+    body: JSON.stringify(args),
+  })
 }
 
 export interface OutreachUploadResult {

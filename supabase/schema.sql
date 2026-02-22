@@ -7,6 +7,7 @@ create table if not exists loads (
   origin text not null,
   destination text not null,
   miles numeric,
+  contract_total_payout_cents bigint,
   status text default 'pending',
   created_at timestamptz default now()
 );
@@ -34,6 +35,7 @@ create table if not exists legs (
   miles numeric,
   handoff_point text,
   rate_cents int,
+  payout_per_mile_cents int,
   status text default 'open',
   driver_id uuid references drivers(id),
   created_at timestamptz default now()

@@ -21,14 +21,47 @@ import {
   legsToNearbyLoads,
 } from "@/lib/backend-api"
 
-function pickHomeLoad(nearbyLoads: NearbyLoad[], driver: Driver | null) {
-  if (!driver || nearbyLoads.length === 0) return nearbyLoads[0] || null
+function pickStayLoad(nearbyLoads: NearbyLoad[]) {
+  if (nearbyLoads.length === 0) return null
+  return [...nearbyLoads].sort((a, b) => {
+    if (b.ratePerMile !== a.ratePerMile) return b.ratePerMile - a.ratePerMile
+    return b.rateCents - a.rateCents
+  })[0]
+}
+
+function pickHomeLoad(nearbyLoads: NearbyLoad[], driver: Driver | null, excludeLoadId?: string) {
+  if (!driver || nearbyLoads.length === 0) return null
   const homeState = driver.homeCity.split(",").pop()?.trim().toUpperCase() || ""
+  const candidates = nearbyLoads.filter((load) => load.id !== excludeLoadId)
+  if (candidates.length === 0) return null
+
   return (
-    nearbyLoads.find((load) => load.destinationState === homeState) ||
-    nearbyLoads.find((load) => load.originState === homeState) ||
-    nearbyLoads[0]
+    candidates.find((load) => load.destinationState === homeState) ||
+    candidates.find((load) => load.originState === homeState) ||
+    candidates[0]
   )
+}
+
+function buildDeadheadHomeOption(driver: Driver | null, homeMiles: number): NearbyLoad {
+  const homeState = driver?.homeCity?.split(",").pop()?.trim().toUpperCase() || "HOME"
+  return {
+    id: "home-deadhead-option",
+    origin: driver?.currentCity || "Current Location",
+    originState: driver?.currentCity?.split(",").pop()?.trim().toUpperCase() || "--",
+    destination: driver?.homeCity || "Home Base",
+    destinationState: homeState,
+    miles: homeMiles,
+    deadheadMiles: homeMiles,
+    rateCents: 0,
+    ratePerMile: 0,
+    pickupTime: "Now",
+    equipment: driver ? `${driver.trailerType} ${driver.trailerLength}` : "Truck",
+    commodity: "Return Home",
+    weight: 0,
+    broker: "Personal Route",
+    direction: "HOME",
+    postedAt: new Date().toISOString(),
+  }
 }
 
 export default function WhatsNextPage() {
@@ -39,6 +72,7 @@ export default function WhatsNextPage() {
   const [choice, setChoice] = useState<"HOME" | "STAY" | null>(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState<string | null>(null)
+  const homeMiles = useMemo(() => Math.max(80, Math.round((driver?.hosRemainingHours || 6) * 45)), [driver])
 
   useEffect(() => {
     const loadData = async () => {
@@ -76,13 +110,15 @@ export default function WhatsNextPage() {
     void loadData()
   }, [])
 
-  const stayLoad = useMemo(() => nearbyLoads[0] || null, [nearbyLoads])
-  const homeLoad = useMemo(() => pickHomeLoad(nearbyLoads, driver), [nearbyLoads, driver])
+  const stayLoad = useMemo(() => pickStayLoad(nearbyLoads), [nearbyLoads])
+  const homeLoad = useMemo(() => {
+    const picked = pickHomeLoad(nearbyLoads, driver, stayLoad?.id)
+    return picked || buildDeadheadHomeOption(driver, homeMiles)
+  }, [nearbyLoads, driver, stayLoad?.id, homeMiles])
   const cycleRemaining = useMemo(
     () => (driver ? Math.max(0, HOS_RULES.maxCycleHours - driver.hosCycleUsed) : 0),
     [driver]
   )
-  const homeMiles = useMemo(() => Math.max(80, Math.round((driver?.hosRemainingHours || 6) * 45)), [driver])
 
   return (
     <div className="flex flex-col gap-6">
@@ -134,7 +170,7 @@ export default function WhatsNextPage() {
         </div>
       )}
 
-      {stayLoad && homeLoad && (
+      {stayLoad && homeLoad && stayLoad.id !== homeLoad.id && (
         <>
           <div className="flex flex-col gap-4">
             <button

@@ -34,6 +34,7 @@ CREATE TABLE IF NOT EXISTS loads (
   origin TEXT NOT NULL,
   destination TEXT NOT NULL,
   miles NUMERIC NOT NULL,
+  contract_total_payout_cents INTEGER,
   status TEXT NOT NULL CHECK (status IN ('OPEN','IN_TRANSIT','COMPLETE')),
   created_at TEXT NOT NULL DEFAULT (datetime('now'))
 );
@@ -60,6 +61,7 @@ CREATE TABLE IF NOT EXISTS legs (
   miles NUMERIC NOT NULL,
   handoff_point TEXT,
   rate_cents INTEGER NOT NULL,
+  payout_per_mile_cents INTEGER,
   status TEXT NOT NULL CHECK (status IN ('OPEN','IN_TRANSIT','COMPLETE')),
   driver_id TEXT REFERENCES drivers(id) ON DELETE SET NULL
 );
@@ -144,6 +146,8 @@ async function getSqliteDb() {
   // Migrate existing DBs: add address columns if missing
   try { await sqliteDb.exec('ALTER TABLE legs ADD COLUMN origin_address TEXT'); } catch (_) { /* already exists */ }
   try { await sqliteDb.exec('ALTER TABLE legs ADD COLUMN destination_address TEXT'); } catch (_) { /* already exists */ }
+  try { await sqliteDb.exec('ALTER TABLE loads ADD COLUMN contract_total_payout_cents INTEGER'); } catch (_) { /* already exists */ }
+  try { await sqliteDb.exec('ALTER TABLE legs ADD COLUMN payout_per_mile_cents INTEGER'); } catch (_) { /* already exists */ }
 
   return sqliteDb;
 }
@@ -153,6 +157,7 @@ async function createLoad(load) {
     origin: load.origin,
     destination: load.destination,
     miles: load.miles,
+    contract_total_payout_cents: load.contract_total_payout_cents ?? null,
     status: load.status || 'OPEN'
   };
 
@@ -176,8 +181,8 @@ async function createLoad(load) {
   const id = load.id || crypto.randomUUID();
 
   await db.run(
-    'INSERT INTO loads (id, origin, destination, miles, status) VALUES (?, ?, ?, ?, ?)',
-    [id, payload.origin, payload.destination, payload.miles, payload.status]
+    'INSERT INTO loads (id, origin, destination, miles, contract_total_payout_cents, status) VALUES (?, ?, ?, ?, ?, ?)',
+    [id, payload.origin, payload.destination, payload.miles, payload.contract_total_payout_cents, payload.status]
   );
 
   return db.get('SELECT * FROM loads WHERE id = ?', [id]);
@@ -199,6 +204,7 @@ async function createLegs(legs) {
       miles: leg.miles,
       handoff_point: leg.handoff_point || null,
       rate_cents: leg.rate_cents,
+      payout_per_mile_cents: leg.payout_per_mile_cents ?? null,
       status,
       driver_id: leg.driver_id || null
     };
@@ -224,8 +230,8 @@ async function createLegs(legs) {
     for (const leg of payload) {
       await db.run(
         `INSERT INTO legs
-        (id, load_id, sequence, origin, destination, origin_address, destination_address, miles, handoff_point, rate_cents, status, driver_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (id, load_id, sequence, origin, destination, origin_address, destination_address, miles, handoff_point, rate_cents, payout_per_mile_cents, status, driver_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           leg.id,
           leg.load_id,
@@ -237,6 +243,7 @@ async function createLegs(legs) {
           leg.miles,
           leg.handoff_point,
           leg.rate_cents,
+          leg.payout_per_mile_cents,
           leg.status,
           leg.driver_id
         ]
