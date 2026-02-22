@@ -4,3 +4,6 @@ node_modules/
 .env*.local
 data/
 ui/.next/
+venv/
+.venv/
+scripts/pdf_extract/venv/

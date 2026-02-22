@@ -1,0 +1,175 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Driver — Relay Haul</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 0 auto; padding: 1.5rem; }
+    a { color: #06c; }
+    h1, h2 { font-size: 1.35rem; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+    .leg-card { border-left: 4px solid #0a5; margin-bottom: 0.75rem; padding: 0.75rem; background: #f9f9f9; border-radius: 4px; }
+    .leg-card.in-transit { border-color: #08c; }
+    .leg-card.complete { border-color: #888; }
+    select { width: 100%; padding: 0.5rem; margin: 0.5rem 0; }
+    button { padding: 0.5rem 1rem; margin-right: 0.5rem; margin-top: 0.25rem; border: none; border-radius: 6px; cursor: pointer; }
+    .btn-accept { background: #0a5; color: #fff; }
+    .btn-complete { background: #08c; color: #fff; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .error { color: #c00; }
+    .add-driver { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #eee; }
+    input { padding: 0.5rem; margin-right: 0.5rem; margin-bottom: 0.5rem; }
+  </style>
+</head>
+<body>
+  <p><a href="index.html">← Relay Haul</a></p>
+  <h1>Driver</h1>
+
+  <div class="card">
+    <h2>Who are you?</h2>
+    <select id="driverSelect">
+      <option value="">— Select driver —</option>
+    </select>
+    <div class="add-driver">
+      <input type="text" id="newDriverName" placeholder="Your name" />
+      <input type="text" id="newDriverEmail" placeholder="email@example.com" />
+      <button type="button" id="addDriverBtn">Add me as driver</button>
+    </div>
+    <p id="driverMsg" class="error"></p>
+  </div>
+
+  <h2>Open legs (accept one)</h2>
+  <div id="openLegs"></div>
+
+  <h2>My legs (in transit — complete when done)</h2>
+  <div id="myLegs"></div>
+
+  <script>
+    const API = window.location.origin;
+
+    function el(id) { return document.getElementById(id); }
+
+    async function loadDrivers() {
+      try {
+        const res = await fetch(API + '/api/drivers');
+        const list = await res.json();
+        const sel = el('driverSelect');
+        const current = sel.value;
+        sel.innerHTML = '<option value="">— Select driver —</option>' + (list || []).map((d) => `<option value="${d.id}">${d.name} (${d.email})</option>`).join('');
+        if (current && list.some((d) => d.id === current)) sel.value = current;
+      } catch (e) {
+        el('driverSelect').innerHTML = '<option value="">Failed to load drivers</option>';
+      }
+    }
+
+    el('addDriverBtn').onclick = async () => {
+      const name = el('newDriverName').value.trim() || 'Demo Driver';
+      const email = el('newDriverEmail').value.trim() || `driver-${Date.now()}@local`;
+      try {
+        const res = await fetch(API + '/api/drivers', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ name, email })
+        });
+        const data = await res.json();
+        if (!res.ok) { el('driverMsg').textContent = data.error || 'Failed'; return; }
+        el('driverMsg').textContent = '';
+        el('newDriverName').value = '';
+        el('newDriverEmail').value = '';
+        loadDrivers();
+        el('driverSelect').value = data.id;
+      } catch (e) {
+        el('driverMsg').textContent = e.message;
+      }
+    };
+
+    function legLabel(leg) {
+      const o = typeof leg.origin === 'object' ? (leg.origin?.label || '—') : leg.origin;
+      const d = typeof leg.destination === 'object' ? (leg.destination?.label || '—') : leg.destination;
+      const handoff = typeof leg.handoff_point === 'object' ? (leg.handoff_point?.name || '—') : (leg.handoff_point || '—');
+      return `${o} → ${d} · ${leg.miles} mi · Handoff: ${handoff}`;
+    }
+
+    async function acceptLeg(legId) {
+      const driverId = el('driverSelect').value;
+      if (!driverId) { alert('Select a driver first.'); return; }
+      try {
+        const res = await fetch(API + '/api/legs/' + legId + '/accept', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ driver_id: driverId, driverId })
+        });
+        const data = await res.json();
+        if (!res.ok) { alert(data.error || 'Accept failed'); return; }
+        loadLegs();
+      } catch (e) {
+        alert(e.message);
+      }
+    }
+
+    async function completeLeg(legId) {
+      const driverId = el('driverSelect').value;
+      if (!driverId) { alert('Select a driver first.'); return; }
+      try {
+        const res = await fetch(API + '/api/legs/' + legId + '/complete', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ driver_id: driverId, driverId })
+        });
+        const data = await res.json();
+        if (!res.ok) { alert(data.error || 'Complete failed'); return; }
+        loadLegs();
+      } catch (e) {
+        alert(e.message);
+      }
+    }
+
+    async function loadLegs() {
+      try {
+        const [openRes, allRes] = await Promise.all([
+          fetch(API + '/api/legs?status=OPEN'),
+          fetch(API + '/api/legs')
+        ]);
+        const openLegs = await openRes.json();
+        const allLegs = await allRes.json();
+        const driverId = el('driverSelect').value;
+        const myLegs = (allLegs || []).filter((l) => l.driver_id === driverId && (l.status === 'IN_TRANSIT' || l.status === 'in_transit'));
+
+        el('openLegs').innerHTML = (openLegs || []).length === 0
+          ? '<p>No open legs right now.</p>'
+          : (openLegs || []).map((leg) => `
+            <div class="leg-card">
+              <div>${legLabel(leg)}</div>
+              <div><strong>${leg.status}</strong> · Rate: ${leg.rate_cents ? (leg.rate_cents / 100).toFixed(2) : '—'} USD</div>
+              <button class="btn-accept" data-id="${leg.id}">Accept this leg</button>
+            </div>`).join('');
+
+        el('openLegs').querySelectorAll('.btn-accept').forEach((btn) => {
+          btn.onclick = () => acceptLeg(btn.dataset.id);
+        });
+
+        el('myLegs').innerHTML = myLegs.length === 0
+          ? '<p>None. Accept a leg above.</p>'
+          : myLegs.map((leg) => `
+            <div class="leg-card in-transit">
+              <div>${legLabel(leg)}</div>
+              <button class="btn-complete" data-id="${leg.id}">Mark complete</button>
+            </div>`).join('');
+
+        el('myLegs').querySelectorAll('.btn-complete').forEach((btn) => {
+          btn.onclick = () => completeLeg(btn.dataset.id);
+        });
+      } catch (e) {
+        el('openLegs').innerHTML = '<p class="error">Failed to load legs.</p>';
+        el('myLegs').innerHTML = '';
+      }
+    }
+
+    el('driverSelect').onchange = loadLegs;
+    loadDrivers().then(loadLegs);
+    setInterval(loadLegs, 8000);
+  </script>
+</body>
+</html>

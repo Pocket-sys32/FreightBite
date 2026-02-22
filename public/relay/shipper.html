@@ -1,0 +1,136 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Shipper — Relay Haul</title>
+  <style>
+    * { box-sizing: border-box; }
+    body { font-family: system-ui, sans-serif; max-width: 640px; margin: 0 auto; padding: 1.5rem; }
+    a { color: #06c; }
+    h1 { font-size: 1.35rem; }
+    .card { border: 1px solid #ddd; border-radius: 8px; padding: 1rem; margin-bottom: 1rem; }
+    label { display: block; margin-top: 0.75rem; font-weight: 600; }
+    input { width: 100%; padding: 0.5rem; margin-top: 0.25rem; }
+    button { margin-top: 1rem; padding: 0.6rem 1.2rem; background: #111; color: #fff; border: none; border-radius: 6px; cursor: pointer; }
+    button:disabled { opacity: 0.6; cursor: not-allowed; }
+    .error { color: #c00; margin-top: 0.5rem; }
+    .success { color: #080; margin-top: 0.5rem; }
+    .leg { border-left: 3px solid #0a5; padding-left: 0.75rem; margin: 0.5rem 0; }
+    .leg.open { border-color: #fa0; }
+    .leg.complete { border-color: #888; }
+    ul { list-style: none; padding: 0; margin: 0; }
+    #loadList li { margin-bottom: 0.5rem; }
+  </style>
+</head>
+<body>
+  <p><a href="index.html">← Relay Haul</a></p>
+  <h1>Shipper — Submit load</h1>
+
+  <div class="card">
+    <label>Origin latitude</label>
+    <input type="number" id="originLat" step="any" placeholder="e.g. 41.88" value="41.88" />
+    <label>Origin longitude</label>
+    <input type="number" id="originLng" step="any" placeholder="e.g. -87.63" value="-87.63" />
+    <label>Destination latitude</label>
+    <input type="number" id="destLat" step="any" placeholder="e.g. 34.05" value="34.05" />
+    <label>Destination longitude</label>
+    <input type="number" id="destLng" step="any" placeholder="e.g. -118.24" value="-118.24" />
+    <button id="submitBtn">Submit load</button>
+    <p id="submitMsg" class="error"></p>
+  </div>
+
+  <h2>Loads</h2>
+  <ul id="loadList"></ul>
+  <div id="loadDetail"></div>
+
+  <script>
+    const API = window.location.origin;
+
+    function el(id) { return document.getElementById(id); }
+    function showSubmitMsg(msg, isError) {
+      const p = el('submitMsg');
+      p.textContent = msg;
+      p.className = isError ? 'error' : 'success';
+    }
+
+    el('submitBtn').onclick = async () => {
+      const origin = { lat: parseFloat(el('originLat').value), lng: parseFloat(el('originLng').value) };
+      const destination = { lat: parseFloat(el('destLat').value), lng: parseFloat(el('destLng').value) };
+      if (Number.isNaN(origin.lat) || Number.isNaN(origin.lng) || Number.isNaN(destination.lat) || Number.isNaN(destination.lng)) {
+        showSubmitMsg('Enter valid numbers for all fields.', true);
+        return;
+      }
+      el('submitBtn').disabled = true;
+      showSubmitMsg('Submitting…');
+      try {
+        const res = await fetch(API + '/api/loads/submit', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ origin, destination })
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          showSubmitMsg(data.error || 'Submit failed', true);
+          return;
+        }
+        showSubmitMsg('Load created. ' + (data.legs?.length || 0) + ' legs.');
+        loadLoads();
+        showLoadDetail(data.load?.id, data.legs || []);
+      } catch (e) {
+        showSubmitMsg(e.message || 'Network error', true);
+      } finally {
+        el('submitBtn').disabled = false;
+      }
+    };
+
+    async function loadLoads() {
+      try {
+        const res = await fetch(API + '/api/loads');
+        const loads = await res.json();
+        const ul = el('loadList');
+        ul.innerHTML = loads.length === 0 ? '<li>No loads yet.</li>' : loads.map((l) => {
+          const origin = typeof l.origin === 'object' ? (l.origin?.label || JSON.stringify(l.origin)) : l.origin;
+          const dest = typeof l.destination === 'object' ? (l.destination?.label || JSON.stringify(l.destination)) : l.destination;
+          return `<li><a href="#" data-id="${l.id}">${origin} → ${dest} (${l.miles} mi)</a></li>`;
+        }).join('');
+        ul.querySelectorAll('a[data-id]').forEach((a) => {
+          a.onclick = (e) => { e.preventDefault(); showLoadDetail(a.dataset.id); };
+        });
+      } catch (e) {
+        el('loadList').innerHTML = '<li class="error">Failed to load list.</li>';
+      }
+    }
+
+    async function showLoadDetail(loadId, legsCached) {
+      const div = el('loadDetail');
+      if (!loadId) { div.innerHTML = ''; return; }
+      div.innerHTML = 'Loading…';
+      try {
+        let legs = legsCached;
+        let load = null;
+        if (!legs) {
+          const res = await fetch(API + '/api/loads/' + loadId);
+          if (!res.ok) { div.innerHTML = 'Load not found.'; return; }
+          load = await res.json();
+          legs = load.legs || [];
+        }
+        const legList = legs.map((leg) => {
+          const o = typeof leg.origin === 'object' ? (leg.origin?.label || '—') : leg.origin;
+          const d = typeof leg.destination === 'object' ? (leg.destination?.label || '—') : leg.destination;
+          const handoff = typeof leg.handoff_point === 'object' ? (leg.handoff_point?.name || '—') : (leg.handoff_point || '—');
+          const status = (leg.status || '').toLowerCase();
+          const cls = status === 'complete' ? 'complete' : status === 'open' ? 'open' : '';
+          return `<div class="leg ${cls}"><strong>Leg ${leg.sequence}</strong> ${o} → ${d} · ${leg.miles} mi · Handoff: ${handoff} · <strong>${leg.status || '—'}</strong></div>`;
+        }).join('');
+        const titleId = load ? load.id : loadId;
+        div.innerHTML = '<div class="card"><strong>Load ' + titleId + '</strong><div style="margin-top:0.5rem">' + legList + '</div></div>';
+      } catch (e) {
+        div.innerHTML = '<p class="error">Failed to load detail.</p>';
+      }
+    }
+
+    loadLoads();
+  </script>
+</body>
+</html>
