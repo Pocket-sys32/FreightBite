@@ -31,9 +31,13 @@ export interface Leg {
   origin: string
   originState: string
   originAddress: string
+  originLat?: number
+  originLng?: number
   destination: string
   destinationState: string
   destinationAddress: string
+  destinationLat?: number
+  destinationLng?: number
   miles: number
   deadheadMiles: number
   handoffPoint: string

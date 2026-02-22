@@ -12,6 +12,7 @@ import {
   Wifi,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { DriverMap } from "@/components/driver-map"
 import { LegCard } from "@/components/leg-card"
 import { cn } from "@/lib/utils"
 import { type Driver, HOS_RULES, type Leg } from "@/lib/mock-data"
@@ -336,6 +337,31 @@ export default function DriverDashboardPage() {
           <span>{notice}</span>
         </div>
       )}
+
+      <section className="rounded-2xl border border-border bg-card p-5 flex flex-col gap-3">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-base font-semibold text-foreground">Live Route Map</h2>
+            <p className="text-xs text-muted-foreground">
+              Select a leg from the map or list to drive the route workflow.
+            </p>
+          </div>
+        </div>
+
+        {driver ? (
+          <DriverMap
+            driver={driver}
+            myLegs={myLegs}
+            openLegs={openLegs}
+            selectedLegId={selectedLegId}
+            onSelectLeg={setSelectedLegId}
+          />
+        ) : (
+          <div className="h-[340px] rounded-xl border border-border bg-secondary/40 flex items-center justify-center p-4 text-sm text-muted-foreground text-center">
+            Driver session is required to render the map.
+          </div>
+        )}
+      </section>
 
       <section className="rounded-2xl border border-border bg-card p-5 flex flex-col gap-4">
         <div className="flex items-center justify-between">
