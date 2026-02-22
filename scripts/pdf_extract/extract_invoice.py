@@ -19,6 +19,7 @@ import argparse
 import os
 import re
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -83,13 +84,22 @@ def _re_date(s: str) -> list[tuple[str, str]]:
     return found
 
 
+# Total rate = load rate/price (total $ for the load). Used for rates.rate_amount / metadata (Supabase).
+COST_FIELDS_BASE = ("amount_due", "total_rate", "line_haul")  # priority order for base cost
+
+
 def _re_money(s: str) -> list[tuple[str, float]]:
-    """Find dollar amounts with optional labels."""
-    # $1,234.56 or 1234.56
+    """Find dollar amounts. total_rate = rate/price (total $ for load); never use per-mile rate as total_rate."""
     amount_re = re.compile(r"\$?\s*([\d,]+(?:\.\d{2})?)")
+    # Match rate_per_mile before generic "rate" so $/mi is not stored as total_rate.
     labels = [
-        (r"total\s*rate|total\s*amount|grand\s*total|amount\s*due", "total_rate"),
-        (r"line\s*haul|linehaul", "line_haul"),
+        (r"amount\s*due|balance\s*due|balance\s*owed|amount\s*owed|payable\s*amount", "amount_due"),
+        (r"rate\s*per\s*mile|per\s*mile|/\s*mi\b|\$\s*per\s*mile|rpm\b", "rate_per_mile"),
+        (r"total\s*rate|total\s*amount|grand\s*total|invoice\s*total|total\s*charges|total\s*due|"
+         r"sum\s*due|net\s*amount|pay\s*this\s*amount|freight\s*total|total\s*freight|"
+         r"shipment\s*total|total\s*invoice|bill\s*total|"
+         r"price\b|load\s*rate|freight\s*rate|\brate\b(?!\s*per\s*mile)", "total_rate"),
+        (r"line\s*haul|linehaul|freight\s*charge|freight\s*charges|haul\s*rate", "line_haul"),
         (r"detention", "detention"),
         (r"lumper|lumpers", "lumper"),
         (r"accessorial|accessorials", "accessorials"),
@@ -97,27 +107,97 @@ def _re_money(s: str) -> list[tuple[str, float]]:
     ]
     results = []
     lines = s.replace("\r", "\n").split("\n")
-    for line in lines:
+    for i, line in enumerate(lines):
         line_lower = line.lower()
         for label_pat, key in labels:
             if re.search(label_pat, line_lower):
                 nums = amount_re.findall(line.replace(",", ""))
+                if not nums and i + 1 < len(lines):
+                    nums = amount_re.findall(lines[i + 1].replace(",", ""))
                 for n in nums:
                     try:
-                        results.append((key, float(n)))
+                        val = float(n)
+                        if val > 0:
+                            results.append((key, val))
                         break
                     except ValueError:
                         pass
                 break
-    # Fallback: look for "Total" or "Amount" and next number on same/next line
-    if not any(k == "total_rate" for k, _ in results):
-        for m in re.finditer(r"(?:total|amount\s*due)[:\s]*\$?\s*([\d,]+(?:\.\d{2})?)", s, re.I):
+    # Fallbacks: various cost phrasings (same or next-line amount)
+    _amount = r"\$?\s*([\d,]+(?:\.\d{2})?)"
+    fallbacks = [
+        (r"amount\s*due\s*(?:\(USD\))?\s*[:\s]*" + _amount, "amount_due"),
+        (r"balance\s*due\s*[:\s]*" + _amount, "amount_due"),
+        (r"total\s*(?:rate|amount|charges|due|freight|invoice)\s*(?:\(USD\))?\s*[:\s]*" + _amount, "total_rate"),
+        (r"(?:grand\s*total|invoice\s*total|net\s*amount)\s*[:\s]*" + _amount, "total_rate"),
+        (r"(?:price|\brate\b)(?!\s*per\s*mile)\s*[:\s]*" + _amount, "total_rate"),
+        (r"line\s*haul\s*[:\s]*" + _amount, "line_haul"),
+    ]
+    for pattern, key in fallbacks:
+        if any(k == key for k, _ in results):
+            continue
+        for m in re.finditer(pattern, s, re.I):
             try:
-                results.append(("total_rate", float(m.group(1).replace(",", ""))))
+                results.append((key, float(m.group(1).replace(",", ""))))
                 break
-            except ValueError:
+            except (ValueError, IndexError):
                 pass
+            break
     return results
+
+
+def _re_pu_so_blocks(s: str) -> dict:
+    """Extract origin from PU/pickup block and destination from SO/delivery block.
+    PU 1 / PU / Pickup = starting point (origin); get pickup_date and origin city/state/zip from that block.
+    SO 2 / SO / Delivery = delivery point (destination); get delivery_date and dest city/state/zip.
+    Address near PU (left/above) = beginning; address under SO = destination. Uses two places for miles then rate_per_mile = cost/miles."""
+    out = {
+        "origin_city": None,
+        "origin_state": None,
+        "origin_zip": None,
+        "destination_city": None,
+        "destination_state": None,
+        "destination_zip": None,
+        "pickup_date": None,
+        "delivery_date": None,
+    }
+    raw = s.replace("\r", "\n")
+    pu_pattern = re.compile(r"\b(?:PU\s*1|PU\s*\d*|\bPU\b|Pickup)\b", re.I)
+    so_pattern = re.compile(r"\b(?:SO\s*2|SO\s*\d*|\bSO\b|Delivery|Dest\.?)\b", re.I)
+    pu_match = pu_pattern.search(raw)
+    so_match = so_pattern.search(raw)
+    if pu_match:
+        start = pu_match.end()
+        end = so_match.start() if (so_match and so_match.start() > pu_match.start()) else len(raw)
+        pu_block = raw[start:end]
+        addr_m = list(re.finditer(r"\b(\w+)\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)\b", pu_block))
+        if addr_m:
+            m = addr_m[-1]
+            out["origin_city"] = m.group(1).strip().upper()[:100]
+            out["origin_state"] = m.group(2).upper()[:2]
+            out["origin_zip"] = m.group(3)
+        date_m = re.search(r"(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})", pu_block)
+        if date_m:
+            mm, dd, yy = date_m.group(1), date_m.group(2), date_m.group(3)
+            yyyy = int(yy) if len(yy) == 4 else 2000 + int(yy)
+            out["pickup_date"] = f"{yyyy}-{int(mm):02d}-{int(dd):02d}"
+    if so_match:
+        start = so_match.end()
+        next_pu = pu_pattern.search(raw, start)
+        end = next_pu.start() if (next_pu and next_pu.start() > start) else len(raw)
+        so_block = raw[start:end]
+        addr_m = list(re.finditer(r"\b(\w+)\s+([A-Z]{2})\s+(\d{5}(?:-\d{4})?)\b", so_block))
+        if addr_m:
+            m = addr_m[-1]
+            out["destination_city"] = m.group(1).strip().upper()[:100]
+            out["destination_state"] = m.group(2).upper()[:2]
+            out["destination_zip"] = m.group(3)
+        date_m = re.search(r"(\d{1,2})[/\-](\d{1,2})[/\-](\d{2,4})", so_block)
+        if date_m:
+            mm, dd, yy = date_m.group(1), date_m.group(2), date_m.group(3)
+            yyyy = int(yy) if len(yy) == 4 else 2000 + int(yy)
+            out["delivery_date"] = f"{yyyy}-{int(mm):02d}-{int(dd):02d}"
+    return out
 
 
 def _re_location(s: str, which: str) -> dict:
@@ -200,7 +280,9 @@ def extract_structured(raw_text: str) -> dict:
         "destination_state": None,
         "destination_zip": None,
         "total_rate": None,
+        "amount_due": None,
         "line_haul": None,
+        "rate_per_mile": None,
         "accessorials": {},
         "detention": None,
         "lumper": None,
@@ -211,6 +293,12 @@ def extract_structured(raw_text: str) -> dict:
         "broker_name": None,
         "truck_number": None,
     }
+
+    # PU 1 / Pickup = origin (starting point); SO 2 / SO = destination. Get pickup_date from PU block, origin/dest from addresses.
+    pu_so = _re_pu_so_blocks(raw_text)
+    for key in ("origin_city", "origin_state", "origin_zip", "destination_city", "destination_state", "destination_zip", "pickup_date", "delivery_date"):
+        if pu_so.get(key):
+            payload[key] = pu_so[key]
 
     dates = _re_date(raw_text)
     for label, val in dates:
@@ -228,21 +316,27 @@ def extract_structured(raw_text: str) -> dict:
             elif not payload["invoice_date"]:
                 payload["invoice_date"] = _normalize_date(val)
 
-    origin = _re_location(raw_text, "origin")
-    payload["origin_city"] = origin.get("city")
-    payload["origin_state"] = origin.get("state")
-    payload["origin_zip"] = origin.get("zip")
+    if not any([payload["origin_city"], payload["origin_state"], payload["origin_zip"]]):
+        origin = _re_location(raw_text, "origin")
+        payload["origin_city"] = origin.get("city")
+        payload["origin_state"] = origin.get("state")
+        payload["origin_zip"] = origin.get("zip")
 
-    dest = _re_location(raw_text, "destination")
-    payload["destination_city"] = dest.get("city")
-    payload["destination_state"] = dest.get("state")
-    payload["destination_zip"] = dest.get("zip")
+    if not any([payload["destination_city"], payload["destination_state"], payload["destination_zip"]]):
+        dest = _re_location(raw_text, "destination")
+        payload["destination_city"] = dest.get("city")
+        payload["destination_state"] = dest.get("state")
+        payload["destination_zip"] = dest.get("zip")
 
     for key, amount in _re_money(raw_text):
         if key == "total_rate":
             payload["total_rate"] = amount
+        elif key == "amount_due":
+            payload["amount_due"] = amount
         elif key == "line_haul":
             payload["line_haul"] = amount
+        elif key == "rate_per_mile":
+            payload["rate_per_mile"] = amount
         elif key == "detention":
             payload["detention"] = amount
             payload["accessorials"]["detention"] = amount
@@ -253,6 +347,10 @@ def extract_structured(raw_text: str) -> dict:
             payload["accessorials"]["other"] = amount
         elif key == "factoring_fee":
             payload["factoring_fee"] = amount
+
+    # Use amount_due as total_rate when invoice only has "Amount Due" (so we have one total for display and rate_per_mile = cost/miles)
+    if payload.get("total_rate") is None and payload.get("amount_due") is not None:
+        payload["total_rate"] = payload["amount_due"]
 
     spec = _re_commodity_weight_equipment(raw_text)
     payload["commodity"] = spec.get("commodity")
@@ -280,33 +378,194 @@ def _normalize_date(s: str) -> str | None:
     return s
 
 
-# --- Optional LLM extraction ---
-def extract_with_llm(raw_text: str) -> dict | None:
-    try:
-        from openai import OpenAI
-        client = OpenAI()
-        prompt = """Extract from this OCR text from a freight invoice/BOL. Return only valid JSON with these keys (use null if not found):
-pickup_date, delivery_date, invoice_date (YYYY-MM-DD),
-origin_city, origin_state, origin_zip,
-destination_city, destination_state, destination_zip,
-total_rate, line_haul, detention, lumper, factoring_fee (numbers),
-commodity, weight (integer lbs), equipment_type,
-broker_name, truck_number.
+# --- Optional LLM extraction: Gemini (preferred, google-genai) or GPT-4o-mini ---
+# Try these in order; first that works with your API key is used (free tier varies by region/key).
+GEMINI_MODEL_FALLBACKS = ("gemini-2.5-flash", "gemini-2.0-flash", "gemini-1.5-flash-8b", "gemini-1.5-flash")
+OPENAI_EXTRACT_MODEL = "gpt-4o-mini"
+
+_EXTRACT_PROMPT = """Extract from this OCR text from a freight invoice/BOL. Return only valid JSON with these keys (use null if not found):
+- pickup_date, delivery_date, invoice_date (YYYY-MM-DD). For pickup_date use the date under PU 1 / PU / Pickup (starting point).
+- origin_city, origin_state, origin_zip: from the address under PU 1 / PU / Pickup (the beginning/left/above). Example: WAVERLY, NY, 14892.
+- destination_city, destination_state, destination_zip: from the address under SO 2 / SO / Delivery (below the PU block). Example: HIRAM, OH, 44234.
+- total_rate, amount_due (base cost for rate-per-mile), line_haul, rate_per_mile (if stated).
+- detention, lumper, factoring_fee (numbers), commodity, weight (integer lbs), equipment_type, broker_name, truck_number.
+Miles are computed from the two places (origin/destination); rate_per_mile = cost / miles.
 
 Text:
 """
+
+
+def _parse_llm_json(content: str) -> dict | None:
+    import json
+    content = (content or "{}").strip().removeprefix("```json").removeprefix("```").strip()
+    try:
+        out = json.loads(content)
+        out.setdefault("amount_due", None)
+        out.setdefault("rate_per_mile", None)
+        return out
+    except json.JSONDecodeError:
+        return None
+
+
+def _extract_with_gemini(raw_text: str, model: str | None = None) -> dict | None:
+    """Extract structured fields using Google Gemini (google-genai SDK). Set GOOGLE_API_KEY in .env.local."""
+    api_key = os.environ.get("GOOGLE_API_KEY") or os.environ.get("GEMINI_API_KEY")
+    if not api_key:
+        print("GOOGLE_API_KEY (or GEMINI_API_KEY) not set; cannot use Gemini.", file=sys.stderr)
+        return None
+    from google import genai
+    client = genai.Client(api_key=api_key)
+    models_to_try = [model] if model else [os.environ.get("GEMINI_MODEL")] + list(GEMINI_MODEL_FALLBACKS)
+    models_to_try = [m for m in models_to_try if m]
+    last_err = None
+    for model_name in models_to_try:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=_EXTRACT_PROMPT + raw_text[:12000],
+                config={"max_output_tokens": 800},
+            )
+            text = (getattr(response, "text", None) or "").strip()
+            if text:
+                out = _parse_llm_json(text)
+                if out is not None:
+                    return out
+        except Exception as e:
+            last_err = e
+            if "404" in str(e) or "not found" in str(e).lower():
+                continue
+            print(f"Gemini extraction failed ({model_name}): {e}", file=sys.stderr)
+            return None
+    print(f"Gemini extraction failed (tried {len(models_to_try)} models). Last error: {last_err}", file=sys.stderr)
+    return None
+
+
+def _extract_with_openai(raw_text: str, model: str | None = None) -> dict | None:
+    """Extract structured fields using OpenAI. Set OPENAI_API_KEY for GPT-4o-mini."""
+    try:
+        from openai import OpenAI
+        client = OpenAI()
+        model_name = model or os.environ.get("OPENAI_MODEL", OPENAI_EXTRACT_MODEL)
         resp = client.chat.completions.create(
-            model=os.environ.get("OPENAI_MODEL", "gpt-4o-mini"),
-            messages=[{"role": "user", "content": prompt + raw_text[:12000]}],
+            model=model_name,
+            messages=[{"role": "user", "content": _EXTRACT_PROMPT + raw_text[:12000]}],
             max_tokens=800,
         )
-        import json
         content = resp.choices[0].message.content or "{}"
-        content = content.strip().removeprefix("```json").removeprefix("```").strip()
-        return json.loads(content)
+        return _parse_llm_json(content)
     except Exception as e:
-        print(f"LLM extraction failed: {e}", file=sys.stderr)
+        print(f"OpenAI extraction failed: {e}", file=sys.stderr)
         return None
+
+
+def extract_with_llm(raw_text: str, model: str | None = None) -> dict | None:
+    """Use OpenAI only for LLM extraction (set OPENAI_API_KEY in .env.local)."""
+    if os.environ.get("OPENAI_API_KEY"):
+        return _extract_with_openai(raw_text, model=model)
+    print("Set OPENAI_API_KEY in .env.local for LLM extraction.", file=sys.stderr)
+    return None
+
+
+# --- Miles and rate per mile (origin/dest -> OSRM distance; rate_per_mile = cost / miles) ---
+def _geocode(city: str, state: str, zip_code: str | None) -> tuple[float, float] | None:
+    """Return (lat, lng) for a US address using Nominatim. Tries full address then city+state (title-case) for robustness."""
+    if not (city or state):
+        return None
+    city = (city or "").strip()
+    state = (state or "").strip()[:2]
+    zip_code = (zip_code or "").strip() or None
+
+    def _try(parts: list) -> tuple[float, float] | None:
+        if not parts:
+            return None
+        try:
+            from geopy.geocoders import Nominatim
+            from geopy.extra.rate_limiter import RateLimiter
+            geocoder = Nominatim(user_agent="freightbite-pdf-extract")
+            geocode = RateLimiter(geocoder.geocode, min_delay_seconds=1.0)
+            addr = ", ".join(parts) + ", USA"
+            loc = geocode(addr)
+            if loc:
+                return (loc.latitude, loc.longitude)
+        except Exception:
+            pass
+        return None
+
+    # Title-case city helps Nominatim (e.g. FILLMORE -> Fillmore, WAVERLY -> Waverly)
+    city_title = city.title() if city else ""
+    # Try full address first, then city+state only if we had zip (fallback when full fails)
+    parts_full = [p for p in [city_title or city, state, zip_code] if p]
+    out = _try(parts_full)
+    if out:
+        return out
+    if zip_code:
+        out = _try([city_title or city, state])
+        if out:
+            return out
+    return None
+
+
+def _driving_miles(origin_lat: float, origin_lng: float, dest_lat: float, dest_lng: float) -> float | None:
+    """Return driving distance in miles via OSRM."""
+    try:
+        import urllib.request
+        import urllib.parse
+        coords = f"{origin_lng},{origin_lat};{dest_lng},{dest_lat}"
+        url = f"http://router.project-osrm.org/route/v1/driving/{coords}?overview=false"
+        with urllib.request.urlopen(url, timeout=10) as resp:
+            import json
+            data = json.loads(resp.read().decode())
+            if data.get("code") == "Ok" and data.get("routes"):
+                meters = data["routes"][0]["distance"]
+                return round(meters * 0.000621371, 1)
+    except Exception:
+        pass
+    return None
+
+
+def compute_miles_and_rate_per_mile(extracted: dict) -> None:
+    """Set miles and rate_per_mile for every invoice. Base cost = first of amount_due, total_rate, line_haul (COST_FIELDS_BASE).
+    When origin + destination exist: use the two addresses to calculate miles (OSRM), then rate_per_mile = base_cost / miles.
+    When no origin/dest: if PDF has rate_per_mile + base_cost, miles = base_cost / rate_per_mile.
+    Always set rate_per_mile = cost / miles when both cost and miles are available."""
+    if not extracted:
+        return
+    base_cost = next((extracted.get(k) for k in COST_FIELDS_BASE if extracted.get(k) is not None), None)
+    rate_per_mile_from_pdf = extracted.get("rate_per_mile")
+
+    origin_city = (extracted.get("origin_city") or "").strip()
+    origin_state = (extracted.get("origin_state") or "").strip()
+    origin_zip = (extracted.get("origin_zip") or "").strip() or None
+    dest_city = (extracted.get("destination_city") or "").strip()
+    dest_state = (extracted.get("destination_state") or "").strip()
+    dest_zip = (extracted.get("destination_zip") or "").strip() or None
+    has_two_destinations = (origin_city or origin_state) and (dest_city or dest_state)
+
+    if has_two_destinations:
+        origin_ll = _geocode(origin_city, origin_state, origin_zip)
+        time.sleep(1.0)
+        dest_ll = _geocode(dest_city, dest_state, dest_zip)
+        if origin_ll and dest_ll:
+            miles = _driving_miles(origin_ll[0], origin_ll[1], dest_ll[0], dest_ll[1])
+            extracted["miles"] = miles
+            if miles and miles > 0 and base_cost and base_cost > 0:
+                extracted["rate_per_mile"] = round(base_cost / miles, 2)
+            elif not extracted.get("rate_per_mile"):
+                extracted["rate_per_mile"] = None
+            return
+    if base_cost and rate_per_mile_from_pdf and rate_per_mile_from_pdf > 0:
+        miles = round(base_cost / rate_per_mile_from_pdf, 1)
+        extracted["miles"] = miles
+        extracted["rate_per_mile"] = round(rate_per_mile_from_pdf, 2)
+        return
+    if "miles" not in extracted or not has_two_destinations:
+        extracted["miles"] = None
+    # Every invoice: whenever we have cost and miles, set rate_per_mile
+    miles = extracted.get("miles")
+    if base_cost and miles and miles > 0 and (extracted.get("rate_per_mile") is None or extracted.get("rate_per_mile") == 0):
+        extracted["rate_per_mile"] = round(base_cost / miles, 2)
+    elif not extracted.get("rate_per_mile"):
+        extracted["rate_per_mile"] = None
 
 
 # --- Supabase ---
@@ -355,8 +614,9 @@ def process_pdf(
 
     if use_llm and os.environ.get("OPENAI_API_KEY"):
         extracted = extract_with_llm(raw_text)
-        if extracted:
-            # Normalize keys to match our payload
+        if extracted is None:
+            extracted = extract_structured(raw_text)
+        else:
             extracted.setdefault("accessorials", {})
             if extracted.get("detention") is not None:
                 extracted["accessorials"]["detention"] = extracted["detention"]
@@ -365,10 +625,13 @@ def process_pdf(
     else:
         extracted = extract_structured(raw_text)
 
+    # Compute miles (origin → dest via OSRM) and rate per mile = total rate / miles
+    compute_miles_and_rate_per_mile(extracted)
+
+    # Supabase documents: filename, file_type, document_type, status, raw_text, metadata (JSONB), user_id (optional)
     metadata = {"extracted": extracted}
     if user_id:
         metadata["user_id"] = user_id
-
     doc_row = {
         "filename": pdf_path.name,
         "file_type": "pdf",
@@ -421,23 +684,44 @@ def process_pdf(
     origin_state = (extracted.get("origin_state") or "").strip() or "XX"
     dest_city = (extracted.get("destination_city") or "").strip() or "Unknown"
     dest_state = (extracted.get("destination_state") or "").strip() or "XX"
-    if company_id and (extracted.get("total_rate") is not None or extracted.get("line_haul") is not None):
-        rate_amount = extracted.get("total_rate") or extracted.get("line_haul") or 0
+    # Base cost: any of these cost forms (priority order); maps to rates.rate_amount / rates.metadata.total_rate (Supabase)
+    base_cost = next(
+        (extracted.get(k) for k in COST_FIELDS_BASE if extracted.get(k) is not None),
+        None,
+    )
+    if company_id and base_cost is not None:
         accessorial_fees = extracted.get("accessorials") or {}
+        rate_per_mile = extracted.get("rate_per_mile")
+        miles = extracted.get("miles")
+        if rate_per_mile is not None and rate_per_mile > 0:
+            rate_type = "per_mile"
+            rate_amount = rate_per_mile
+        else:
+            rate_type = "flat"
+            rate_amount = base_cost
+        rate_metadata = {}
+        if miles is not None:
+            rate_metadata["miles"] = miles
+        if base_cost is not None:
+            rate_metadata["total_rate"] = base_cost
         try:
-            sb.table("rates").insert({
+            # Supabase rates table: document_id, company_id, origin_*, destination_*, rate_type, rate_amount, accessorial_fees, equipment_type, min_weight, metadata (JSONB)
+            row = {
                 "document_id": doc_id,
                 "company_id": company_id,
                 "origin_city": origin_city[:100],
                 "origin_state": origin_state[:2],
                 "destination_city": dest_city[:100],
                 "destination_state": dest_state[:2],
-                "rate_type": "flat",
-                "rate_amount": rate_amount,
+                "rate_type": rate_type,  # 'per_mile' | 'flat' | 'per_hundredweight' | 'other'
+                "rate_amount": round(float(rate_amount), 2),
                 "accessorial_fees": accessorial_fees,
                 "equipment_type": (extracted.get("equipment_type") or "")[:50] or None,
                 "min_weight": extracted.get("weight"),
-            }).execute()
+            }
+            if rate_metadata:
+                row["metadata"] = rate_metadata
+            sb.table("rates").insert(row).execute()
         except Exception as e:
             print(f"Rate insert failed: {e}", file=sys.stderr)
 

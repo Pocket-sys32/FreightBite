@@ -8,7 +8,7 @@ Extracts structured data from **scanned** (image-only) PDFs using OCR and upsert
 |----------|--------|
 | **Dates** | Pickup Date, Delivery Date, Invoice Date |
 | **Locations** | Origin City/State/Zip, Destination City/State/Zip |
-| **Financials** | Total Rate, Line Haul, Accessorials (Detention, Lumper), Factoring Fees |
+| **Financials** | Total Rate, Line Haul, Accessorials (Detention, Lumper), Factoring Fees; **Rate per mile** (miles from origin→dest via OSRM, then total rate ÷ miles) |
 | **Load specs** | Commodity, Weight, Equipment Type |
 | **Entities** | Broker Name, Truck # |
 
