@@ -15,6 +15,11 @@ export const metadata: Metadata = {
 
 export const viewport: Viewport = {
   themeColor: '#f5f0ea',
+  width: 'device-width',
+  initialScale: 1,
+  maximumScale: 1,
+  viewportFit: 'cover',
+  userScalable: false,
 }
 
 export default function RootLayout({
@@ -23,8 +28,8 @@ export default function RootLayout({
   children: React.ReactNode
 }>) {
   return (
-    <html lang="en">
-      <body className="font-sans antialiased min-h-screen bg-background text-foreground">
+    <html lang="en" className="h-full">
+      <body className="font-sans antialiased min-h-screen min-h-[100dvh] bg-background text-foreground overflow-x-hidden w-full">
         {children}
         <Analytics />
       </body>

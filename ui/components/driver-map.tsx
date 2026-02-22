@@ -136,6 +136,7 @@ export function DriverMap({ driver, myLegs, openLegs, livePosition, selectedLegI
       if (mergedLegs.length === 0) {
         setRoutedLegs([])
         setRouteError(null)
+        initialViewAppliedRef.current = false
         return
       }
 
@@ -183,10 +184,20 @@ export function DriverMap({ driver, myLegs, openLegs, livePosition, selectedLegI
     }
   }, [isLoaded, mergedLegs])
 
+  const lastAppliedViewRef = useRef<{ selectedLegId: string | null }>({ selectedLegId: null })
+  const initialViewAppliedRef = useRef(false)
+
   useEffect(() => {
-    if (!isLoaded || !mapRef.current) return
+    if (!isLoaded || !mapRef.current || routedLegs.length === 0) return
     const googleObj = (window as Window & { google?: any }).google
     if (!googleObj?.maps) return
+
+    const selectedLegChanged = lastAppliedViewRef.current.selectedLegId !== selectedLegId
+    const shouldApplyView = !initialViewAppliedRef.current || selectedLegChanged
+    if (!shouldApplyView) return
+
+    lastAppliedViewRef.current = { selectedLegId: selectedLegId ?? null }
+    initialViewAppliedRef.current = true
 
     const bounds = new googleObj.maps.LatLngBounds()
     bounds.extend(markerPosition)
@@ -253,14 +264,14 @@ export function DriverMap({ driver, myLegs, openLegs, livePosition, selectedLegI
   }
 
   return (
-    <div className="relative w-full overflow-hidden rounded-xl border border-border" style={{ height: "340px" }}>
+    <div className="relative w-full overflow-hidden rounded-xl border border-border h-[220px] sm:h-[340px]">
       <GoogleMap
         mapContainerStyle={{ width: "100%", height: "100%" }}
         onLoad={(map) => {
           mapRef.current = map
         }}
-        center={markerPosition}
-        zoom={11}
+        defaultCenter={markerPosition}
+        defaultZoom={11}
         options={{
           mapTypeControl: false,
           streetViewControl: false,

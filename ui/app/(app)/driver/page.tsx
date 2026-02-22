@@ -459,121 +459,101 @@ export default function DriverDashboardPage() {
   const shiftRemaining = Math.max(0, HOS_RULES.maxDrivingHours - shiftUsed)
 
   return (
-    <div className="flex flex-col gap-6">
-      <div className="rounded-2xl bg-card border border-border p-5">
-        <div className="flex items-center justify-between mb-3">
-          <span className="text-xs font-semibold text-muted-foreground uppercase tracking-widest">Hours of Service</span>
-          <span className={`text-xs font-bold uppercase tracking-widest ${hosColor(shiftRemaining)}`}>
+    <div className="flex flex-col gap-4 sm:gap-6 min-w-0">
+      <div className="rounded-xl sm:rounded-2xl bg-card border border-border p-4 sm:p-5 min-w-0">
+        <div className="flex items-center justify-between gap-2 mb-2 sm:mb-3">
+          <span className="text-[10px] sm:text-xs font-semibold text-muted-foreground uppercase tracking-wider">Hours of Service</span>
+          <span className={`text-[10px] sm:text-xs font-bold uppercase tracking-wider truncate ${hosColor(shiftRemaining)}`}>
             {hosUsage.activelyDriving ? "Driving" : "Paused / Off Duty"}
           </span>
         </div>
 
         <div className="flex items-baseline gap-2 mb-2">
-          <span className={`text-5xl font-bold tabular-nums tracking-tight ${hosColor(shiftRemaining)}`}>
+          <span className={`text-4xl sm:text-5xl font-bold tabular-nums tracking-tight ${hosColor(shiftRemaining)}`}>
             {shiftUsed.toFixed(1)}
           </span>
-          <span className="text-lg text-muted-foreground font-medium">/ {HOS_RULES.maxDrivingHours} hrs driving</span>
+          <span className="text-sm sm:text-lg text-muted-foreground font-medium">/ {HOS_RULES.maxDrivingHours} hrs</span>
         </div>
 
-        <div className="relative h-3 w-full rounded-full bg-secondary overflow-hidden mb-4">
+        <div className="relative h-2.5 sm:h-3 w-full rounded-full bg-secondary overflow-hidden mb-3 sm:mb-4">
           <div className={`absolute inset-y-0 left-0 rounded-full transition-all duration-500 ${hosBg(shiftRemaining)}`} style={{ width: `${hosBarPct(shiftUsed)}%` }} />
         </div>
 
         <div className="flex items-center justify-between mb-1.5">
-          <span className="text-[10px] text-muted-foreground uppercase tracking-wider font-semibold">70-hr / 8-day cycle</span>
+          <span className="text-[10px] text-muted-foreground uppercase tracking-wider font-semibold">70-hr / 8-day</span>
           <span className="text-xs text-muted-foreground tabular-nums">{cycleUsed.toFixed(1)} / {HOS_RULES.maxCycleHours} hrs</span>
         </div>
 
-        <div className="relative h-2 w-full rounded-full bg-secondary overflow-hidden mb-4">
+        <div className="relative h-1.5 sm:h-2 w-full rounded-full bg-secondary overflow-hidden mb-3 sm:mb-4">
           <div className="absolute inset-y-0 left-0 rounded-full bg-primary/60 transition-all duration-500" style={{ width: `${cycleBarPct(cycleUsed)}%` }} />
         </div>
 
-        <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
-          <span>{driver?.currentCity || "No driver loaded"}</span>
-          <span className="text-border">|</span>
-          <span>{driver?.trailerType || "Trailer"} {driver?.trailerLength || ""}</span>
-          <span className="text-border">|</span>
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] sm:text-xs text-muted-foreground min-w-0">
+          <span className="truncate">{driver?.currentCity || "No driver loaded"}</span>
+          <span className="text-border shrink-0">|</span>
+          <span className="truncate">{driver?.trailerType || "Trailer"} {driver?.trailerLength || ""}</span>
+          <span className="text-border shrink-0">|</span>
           <span className="font-mono">{driver?.mcNumber || "--"}</span>
-          <span className="text-border">|</span>
-          <span>{myLegs.length} connected legs</span>
+          <span className="text-border shrink-0">|</span>
+          <span>{myLegs.length} legs</span>
         </div>
       </div>
 
-      <div className="flex items-center gap-2 px-1">
-        <Wifi className="h-3 w-3 text-success" />
-        <span className="text-[10px] text-muted-foreground">
-          {loading
-            ? "Syncing route state..."
-            : `Synced live board · ${myLegs.length} mine · ${openLegs.length} open`}
-        </span>
-      </div>
-
-      <div className="flex items-center gap-2 px-1">
-        <MapPin className={`h-3 w-3 ${gpsStatus === "watching" ? "text-success" : "text-warning"}`} />
-        <span className="text-[10px] text-muted-foreground">
-          {gpsStatus === "watching"
-            ? "Live GPS active"
-            : gpsStatus === "unsupported"
-            ? "GPS unsupported on this device"
-            : gpsStatus === "blocked"
-            ? "GPS blocked - allow location for route completion"
-            : "GPS not started"}
-        </span>
+      <div className="flex items-center gap-2 text-[11px] sm:text-xs text-muted-foreground min-w-0">
+        <Wifi className="h-3.5 w-3.5 shrink-0 text-success" />
+        <span className="truncate">{loading ? "Syncing…" : `${myLegs.length} mine · ${openLegs.length} open`}</span>
+        <MapPin className={`h-3.5 w-3.5 shrink-0 ml-auto ${gpsStatus === "watching" ? "text-success" : "text-muted-foreground"}`} />
       </div>
 
       {error && (
-        <div className="rounded-xl border border-destructive/25 bg-destructive/10 p-3 text-sm text-destructive flex items-center gap-2">
-          <AlertCircle className="h-4 w-4" />
-          <span>{error}</span>
+        <div className="rounded-xl border border-destructive/25 bg-destructive/10 p-3 text-sm text-destructive flex items-center gap-2 min-w-0">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          <span className="min-w-0">{error}</span>
         </div>
       )}
 
       {notice && (
-        <div className="rounded-xl border border-success/30 bg-success/10 p-3 text-sm text-success flex items-center gap-2">
-          <CheckCircle2 className="h-4 w-4" />
-          <span>{notice}</span>
+        <div className="rounded-xl border border-success/30 bg-success/10 p-3 text-sm text-success flex items-center gap-2 min-w-0">
+          <CheckCircle2 className="h-4 w-4 shrink-0" />
+          <span className="min-w-0">{notice}</span>
         </div>
       )}
 
       {gpsError && (
-        <div className="rounded-xl border border-warning/25 bg-warning/10 p-3 text-sm text-warning flex items-center gap-2">
-          <AlertCircle className="h-4 w-4" />
-          <span>{gpsError}</span>
+        <div className="rounded-xl border border-warning/25 bg-warning/10 p-3 text-sm text-warning flex items-center gap-2 min-w-0">
+          <AlertCircle className="h-4 w-4 shrink-0" />
+          <span className="min-w-0">{gpsError}</span>
         </div>
       )}
 
-      <section className="rounded-2xl border border-border bg-card p-5 flex flex-col gap-3">
-        <div className="flex items-center justify-between">
-          <div>
-            <h2 className="text-base font-semibold text-foreground">Live Route Map</h2>
-            <p className="text-xs text-muted-foreground">
-              Select a leg from the map or list to drive the route workflow.
-            </p>
-          </div>
+      <section className="rounded-xl sm:rounded-2xl border border-border bg-card p-4 sm:p-5 flex flex-col gap-3 min-w-0">
+        <div>
+          <h2 className="text-sm sm:text-base font-semibold text-foreground">Live Route Map</h2>
+          <p className="text-[11px] sm:text-xs text-muted-foreground mt-0.5">Select a leg from the map or list.</p>
         </div>
 
         {driver ? (
-          <DriverMap
-            driver={driver}
-            myLegs={myLegs}
-            openLegs={openLegs}
-            livePosition={livePosition}
-            selectedLegId={selectedLegId}
-            onSelectLeg={setSelectedLegId}
-          />
+          <div className="rounded-lg overflow-hidden border border-border w-full min-w-0 -mx-0.5 sm:mx-0">
+            <DriverMap
+              driver={driver}
+              myLegs={myLegs}
+              openLegs={openLegs}
+              livePosition={livePosition}
+              selectedLegId={selectedLegId}
+              onSelectLeg={setSelectedLegId}
+            />
+          </div>
         ) : (
-          <div className="h-[340px] rounded-xl border border-border bg-secondary/40 flex items-center justify-center p-4 text-sm text-muted-foreground text-center">
+          <div className="h-[220px] sm:h-[340px] rounded-lg border border-border bg-secondary/40 flex items-center justify-center p-4 text-sm text-muted-foreground text-center">
             Driver session is required to render the map.
           </div>
         )}
       </section>
 
-      <section className="rounded-2xl border border-border bg-card p-5 flex flex-col gap-4">
-        <div className="flex items-center justify-between">
-          <div>
-            <h2 className="text-base font-semibold text-foreground">My Connected Legs</h2>
-            <p className="text-xs text-muted-foreground">Leg handoffs are linked as a chain and update the next driver automatically.</p>
-          </div>
+      <section className="rounded-xl sm:rounded-2xl border border-border bg-card p-4 sm:p-5 flex flex-col gap-3 sm:gap-4 min-w-0">
+        <div>
+          <h2 className="text-sm sm:text-base font-semibold text-foreground">My Connected Legs</h2>
+          <p className="text-[11px] sm:text-xs text-muted-foreground mt-0.5 hidden sm:block">Leg handoffs are linked as a chain.</p>
         </div>
 
         {myLegs.length === 0 && !loading ? (
@@ -598,13 +578,13 @@ export default function DriverDashboardPage() {
                 <div
                   key={leg.id}
                   className={cn(
-                    "rounded-xl border p-4 transition-colors",
+                    "rounded-xl border p-3 sm:p-4 transition-colors min-w-0",
                     isSelected ? "border-primary bg-primary/5" : "border-border bg-secondary/30"
                   )}
                 >
-                  <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
-                    <p className="text-sm font-semibold text-foreground">
-                      Leg {leg.sequence}: {leg.origin} {">"} {leg.destination}
+                  <div className="flex flex-wrap items-center justify-between gap-2 mb-2 min-w-0">
+                    <p className="text-xs sm:text-sm font-semibold text-foreground leading-tight min-w-0 truncate">
+                      Leg {leg.sequence}: {leg.origin} → {leg.destination}
                     </p>
                     <div className="flex items-center gap-2">
                       <span className="rounded-full bg-secondary px-2.5 py-1 text-[10px] font-semibold uppercase tracking-wider text-muted-foreground">
@@ -616,9 +596,9 @@ export default function DriverDashboardPage() {
                     </div>
                   </div>
 
-                  <div className="grid gap-2 text-xs text-muted-foreground sm:grid-cols-2">
-                    <p>
-                      <span className="font-semibold text-foreground">Exact handoff:</span> {leg.handoffAddress}
+                  <div className="grid gap-1.5 text-[11px] sm:text-xs text-muted-foreground sm:grid-cols-2 min-w-0">
+                    <p className="min-w-0 truncate sm:truncate-0" title={leg.handoffAddress}>
+                      <span className="font-semibold text-foreground">Handoff:</span> {leg.handoffAddress}
                     </p>
                     <p>
                       <span className="font-semibold text-foreground">Previous / Next:</span>{" "}
@@ -664,13 +644,14 @@ export default function DriverDashboardPage() {
                       View Map
                     </Button>
 
-                    <Button asChild variant="outline" size="sm">
-                      <Link href={`/driver/route/${leg.id}`}>Get Directions</Link>
+                    <Button asChild variant="outline" size="sm" className="min-h-[44px] touch-manipulation">
+                      <Link href={`/driver/route/${leg.id}`}>Directions</Link>
                     </Button>
 
                     {action && (
                       <Button
                         size="sm"
+                        className="min-h-[44px] touch-manipulation"
                         onClick={() => void handleLegAction(leg)}
                         disabled={isBusy || handoffBlocked}
                         variant={confirmHandoffLegId === leg.id ? "destructive" : "default"}
@@ -690,6 +671,7 @@ export default function DriverDashboardPage() {
                       <Button
                         size="sm"
                         variant="secondary"
+                        className="min-h-[44px] touch-manipulation"
                         onClick={() => void handlePauseToggle(leg)}
                         disabled={isPauseBusy}
                       >
@@ -705,18 +687,19 @@ export default function DriverDashboardPage() {
         )}
       </section>
 
-      <section className="flex flex-col gap-4">
-        <div className="flex items-center justify-between">
-          <h2 className="text-base font-semibold text-foreground">Open Legs Board</h2>
-          <span className="text-sm text-muted-foreground">{filteredOpenLegs.length} legs</span>
+      <section className="flex flex-col gap-3 sm:gap-4 min-w-0">
+        <div className="flex items-center justify-between gap-2">
+          <h2 className="text-sm sm:text-base font-semibold text-foreground">Open Legs</h2>
+          <span className="text-xs sm:text-sm text-muted-foreground">{filteredOpenLegs.length} legs</span>
         </div>
 
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap gap-2">
           {(["all", "nearby", "high-pay"] as const).map((option) => (
             <button
               key={option}
+              type="button"
               onClick={() => setFilter(option)}
-              className={`rounded-lg px-4 py-2.5 text-sm font-medium min-h-[44px] transition-colors ${
+              className={`rounded-lg px-3.5 py-2.5 text-sm font-medium min-h-[44px] min-w-[44px] touch-manipulation transition-colors ${
                 filter === option ? "bg-primary text-primary-foreground" : "bg-secondary text-muted-foreground active:bg-border"
               }`}
             >
@@ -725,7 +708,7 @@ export default function DriverDashboardPage() {
           ))}
         </div>
 
-        <div className="flex flex-col gap-4">
+        <div className="flex flex-col gap-3 sm:gap-4 min-w-0">
           {filteredOpenLegs.map((leg) => (
             <LegCard
               key={leg.id}
@@ -737,12 +720,12 @@ export default function DriverDashboardPage() {
         </div>
 
         {!loading && filteredOpenLegs.length === 0 && (
-          <div className="flex flex-col items-center justify-center rounded-2xl border border-border bg-card py-16 gap-4">
-            <SlidersHorizontal className="h-6 w-6 text-muted-foreground" />
-            <p className="text-sm text-muted-foreground">
-              {openLegs.length === 0 ? "No open legs on the board yet" : "No legs match this filter"}
+          <div className="flex flex-col items-center justify-center rounded-xl sm:rounded-2xl border border-border bg-card py-10 sm:py-16 gap-3 sm:gap-4 px-4">
+            <SlidersHorizontal className="h-5 w-5 sm:h-6 sm:w-6 text-muted-foreground" />
+            <p className="text-sm text-muted-foreground text-center">
+              {openLegs.length === 0 ? "No open legs yet" : "No legs match filter"}
             </p>
-            <Button variant="outline" className="rounded-lg min-h-[44px]" onClick={() => setFilter("all")}>
+            <Button variant="outline" className="rounded-lg min-h-[44px] touch-manipulation" onClick={() => setFilter("all")}>
               Show All
             </Button>
           </div>

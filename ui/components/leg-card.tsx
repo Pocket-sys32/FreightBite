@@ -53,20 +53,19 @@ export function LegCard({
   return (
     <div
       className={cn(
-        "rounded-2xl border transition-colors",
+        "rounded-xl sm:rounded-2xl border transition-colors min-w-0",
         isAccepted
           ? "border-success/40 bg-success/5"
           : "border-border bg-card"
       )}
     >
-      <div className="p-5 flex flex-col gap-4">
-        {/* Route line */}
-        <div className="flex items-center gap-3">
-          <div className="flex h-10 w-10 shrink-0 items-center justify-center rounded-xl bg-primary/15">
-            <MapPin className="h-5 w-5 text-primary" />
+      <div className="p-4 sm:p-5 flex flex-col gap-3 sm:gap-4 min-w-0">
+        <div className="flex items-center gap-2.5 sm:gap-3 min-w-0">
+          <div className="flex h-9 w-9 sm:h-10 sm:w-10 shrink-0 items-center justify-center rounded-lg sm:rounded-xl bg-primary/15">
+            <MapPin className="h-4 w-4 sm:h-5 sm:w-5 text-primary" />
           </div>
           <div className="flex-1 min-w-0">
-            <p className="text-base font-bold text-foreground truncate">
+            <p className="text-sm sm:text-base font-bold text-foreground truncate">
               {leg.origin} <span className="text-muted-foreground font-normal mx-1">{">"}</span> {leg.destination}
             </p>
             <p className="text-xs text-muted-foreground truncate">{leg.originAddress}</p>
@@ -86,31 +85,28 @@ export function LegCard({
           </div>
         </div>
 
-        {/* Key stats */}
-        <div className="grid grid-cols-3 gap-3">
-          <div className="rounded-xl bg-secondary p-3 text-center">
-            <p className="text-xl font-bold text-foreground tabular-nums">{leg.miles}</p>
-            <p className="text-[10px] text-muted-foreground font-medium uppercase tracking-wider mt-0.5">miles</p>
+        <div className="grid grid-cols-3 gap-2 sm:gap-3 min-w-0">
+          <div className="rounded-lg sm:rounded-xl bg-secondary p-2.5 sm:p-3 text-center min-w-0">
+            <p className="text-lg sm:text-xl font-bold text-foreground tabular-nums">{leg.miles}</p>
+            <p className="text-[10px] text-muted-foreground font-medium uppercase tracking-wider mt-0.5">mi</p>
           </div>
-          <div className="rounded-xl bg-secondary p-3 text-center">
-            <p className="text-xl font-bold text-success tabular-nums">${totalPay.toLocaleString()}</p>
-            <p className="text-[10px] text-muted-foreground font-medium uppercase tracking-wider mt-0.5">total pay</p>
+          <div className="rounded-lg sm:rounded-xl bg-secondary p-2.5 sm:p-3 text-center min-w-0">
+            <p className="text-lg sm:text-xl font-bold text-success tabular-nums">${totalPay.toLocaleString()}</p>
+            <p className="text-[10px] text-muted-foreground font-medium uppercase tracking-wider mt-0.5">total</p>
           </div>
-          <div className="rounded-xl bg-secondary p-3 text-center">
-            <p className="text-xl font-bold text-foreground tabular-nums">${leg.ratePerMile.toFixed(2)}</p>
-            <p className="text-[10px] text-muted-foreground font-medium uppercase tracking-wider mt-0.5">per mi</p>
+          <div className="rounded-lg sm:rounded-xl bg-secondary p-2.5 sm:p-3 text-center min-w-0">
+            <p className="text-lg sm:text-xl font-bold text-foreground tabular-nums">${leg.ratePerMile.toFixed(2)}</p>
+            <p className="text-[10px] text-muted-foreground font-medium uppercase tracking-wider mt-0.5">/mi</p>
           </div>
         </div>
 
-        {/* Handoff truck stop */}
-        <div className="rounded-xl bg-primary/8 border border-primary/15 px-4 py-3">
-          <p className="text-xs text-muted-foreground">Handoff at</p>
-          <p className="text-sm font-bold text-foreground mt-0.5">{leg.handoffPoint}</p>
-          <p className="text-xs text-muted-foreground mt-0.5">{leg.handoffAddress}</p>
+        <div className="rounded-lg sm:rounded-xl bg-primary/8 border border-primary/15 px-3 py-2.5 sm:px-4 sm:py-3 min-w-0">
+          <p className="text-[11px] sm:text-xs text-muted-foreground">Handoff at</p>
+          <p className="text-xs sm:text-sm font-bold text-foreground mt-0.5 truncate">{leg.handoffPoint}</p>
+          <p className="text-[11px] sm:text-xs text-muted-foreground mt-0.5 truncate">{leg.handoffAddress}</p>
         </div>
 
-        {/* Commodity & weight */}
-        <div className="flex items-center gap-2 text-xs text-muted-foreground">
+        <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 text-[11px] sm:text-xs text-muted-foreground min-w-0">
           <Package className="h-3 w-3" />
           <span>{leg.commodity}</span>
           <span className="text-border">|</span>
@@ -124,12 +120,12 @@ export function LegCard({
           {summary}
         </p>
 
-        {/* Accept button */}
         {showAccept && !isAccepted && leg.status === "OPEN" && (
           <button
+            type="button"
             onClick={handleAccept}
             disabled={isAccepting}
-            className="w-full rounded-2xl bg-success text-success-foreground font-bold text-base py-4 min-h-[56px] active:scale-[0.98] transition-transform disabled:opacity-60"
+            className="w-full rounded-xl sm:rounded-2xl bg-success text-success-foreground font-bold text-sm sm:text-base py-3.5 sm:py-4 min-h-[48px] sm:min-h-[56px] active:scale-[0.98] transition-transform disabled:opacity-60 touch-manipulation"
           >
             {isAccepting ? (
               <span className="inline-flex items-center gap-2">
@@ -142,9 +138,9 @@ export function LegCard({
           </button>
         )}
         {isAccepted && (
-          <div className="flex items-center justify-center gap-2 rounded-2xl bg-success/15 border border-success/30 py-4 min-h-[56px] text-success font-bold">
-            <CheckCircle2 className="h-5 w-5" />
-            Accepted - Head to Pickup
+          <div className="flex items-center justify-center gap-2 rounded-xl sm:rounded-2xl bg-success/15 border border-success/30 py-3.5 sm:py-4 min-h-[48px] sm:min-h-[56px] text-success font-bold text-sm sm:text-base">
+            <CheckCircle2 className="h-4 w-4 sm:h-5 sm:w-5" />
+            Accepted – Head to Pickup
           </div>
         )}
       </div>

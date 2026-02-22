@@ -1,6 +1,6 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import {
   Home,
   Truck,
@@ -206,6 +206,10 @@ export default function WhatsNextPage() {
     }
   }, [homeInput])
 
+  const gpsPosRef = useRef<{ lat: number; lng: number } | null>(null)
+  const lastGpsUpdateRef = useRef<number>(0)
+  const GPS_THROTTLE_MS = 15000
+
   useEffect(() => {
     if (typeof window === "undefined" || !window.navigator?.geolocation) {
       setGpsStatus("unavailable")
@@ -214,7 +218,14 @@ export default function WhatsNextPage() {
 
     const watchId = navigator.geolocation.watchPosition(
       (pos) => {
-        setGpsPos({ lat: pos.coords.latitude, lng: pos.coords.longitude })
+        const next = { lat: pos.coords.latitude, lng: pos.coords.longitude }
+        const now = Date.now()
+        const prev = gpsPosRef.current
+        const same = prev && Math.abs(prev.lat - next.lat) < 1e-5 && Math.abs(prev.lng - next.lng) < 1e-5
+        if (same && now - lastGpsUpdateRef.current < GPS_THROTTLE_MS) return
+        gpsPosRef.current = next
+        lastGpsUpdateRef.current = now
+        setGpsPos(next)
         setGpsStatus("live")
       },
       () => setGpsStatus("blocked"),
@@ -225,21 +236,22 @@ export default function WhatsNextPage() {
   }, [])
 
   useEffect(() => {
+    let cancelled = false
+    setLoading(true)
+    setError(null)
+
     const loadData = async () => {
-      setLoading(true)
-      setError(null)
       try {
         const selectedDriver = await fetchCurrentDriver()
+        if (cancelled) return
         setDriver(selectedDriver)
 
         const openLegs = await fetchLegs({ status: "OPEN" })
+        if (cancelled) return
         let loads = legsToNearbyLoads(openLegs)
 
-        if (gpsPos && loads.length > 0) {
-          loads = loads.map((load) => {
-            const originLat = load.originState ? undefined : undefined
-            return load
-          })
+        const pos = gpsPosRef.current
+        if (pos && loads.length > 0) {
           loads.sort((a, b) => {
             const aScore = a.ratePerMile * 100 - (a.deadheadMiles || 0) * 0.3
             const bScore = b.ratePerMile * 100 - (b.deadheadMiles || 0) * 0.3
@@ -250,14 +262,19 @@ export default function WhatsNextPage() {
         loads = loads.slice(0, 6)
         setNearbyLoads(loads)
       } catch (loadError) {
-        setError(loadError instanceof Error ? loadError.message : "Failed to load data")
+        if (!cancelled) {
+          setError(loadError instanceof Error ? loadError.message : "Failed to load data")
+        }
       } finally {
-        setLoading(false)
+        if (!cancelled) setLoading(false)
       }
     }
 
     void loadData()
-  }, [gpsPos])
+    return () => {
+      cancelled = true
+    }
+  }, [])
 
   const stayLoad = useMemo(() => pickStayLoad(nearbyLoads, gpsPos), [nearbyLoads, gpsPos])
   const locationDisplay = currentLocationLabel ?? driver?.currentCity ?? "Current location"
