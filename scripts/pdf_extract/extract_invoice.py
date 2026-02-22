@@ -268,6 +268,38 @@ def _re_broker_truck(s: str) -> dict:
     return out
 
 
+def _re_client(s: str) -> dict:
+    """Extract client/customer name and optional address, phone from PDF."""
+    out = {"client_name": None, "client_address": None, "client_phone": None, "client_city": None, "client_state": None, "client_zip": None}
+    for label in ["client", "customer", "bill\s*to", "sold\s*to", "consignee", "payer"]:
+        m = re.search(rf"{label}\s*[:\s]+([^\n]+(?:\n[^\n]+)?)", s, re.I | re.DOTALL)
+        if m:
+            block = m.group(1).strip()
+            lines = [ln.strip() for ln in block.split("\n") if ln.strip()][:4]
+            if lines:
+                out["client_name"] = lines[0][:200]
+            if len(lines) > 1:
+                out["client_address"] = " ".join(lines[1:-1])[:300] if len(lines) > 2 else lines[1][:300]
+            if len(lines) >= 2:
+                last = lines[-1]
+                phone_m = re.search(r"\(?\d{3}\)?[\s.\-]?\d{3}[\s.\-]?\d{4}", last)
+                if phone_m:
+                    out["client_phone"] = re.sub(r"\s+", " ", phone_m.group(0))[:30]
+                city_st_zip = re.search(r"([A-Za-z\s\.\-]+),\s*([A-Z]{2})\s+(\d{5}(?:-\d{4})?)", last)
+                if city_st_zip:
+                    out["client_city"] = city_st_zip.group(1).strip()[:100]
+                    out["client_state"] = city_st_zip.group(2).upper()[:2]
+                    out["client_zip"] = city_st_zip.group(3)
+            break
+    if not out["client_name"]:
+        for label in ["client\s*name", "customer\s*name"]:
+            m = re.search(rf"{label}\s*[:\s]+([^\n]+)", s, re.I)
+            if m:
+                out["client_name"] = m.group(1).strip()[:200]
+                break
+    return out
+
+
 def extract_structured(raw_text: str) -> dict:
     """Build one structured payload from raw OCR text."""
     payload = {
@@ -293,6 +325,12 @@ def extract_structured(raw_text: str) -> dict:
         "equipment_type": None,
         "broker_name": None,
         "truck_number": None,
+        "client_name": None,
+        "client_address": None,
+        "client_phone": None,
+        "client_city": None,
+        "client_state": None,
+        "client_zip": None,
     }
 
     # PU 1 / Pickup = origin (starting point); SO 2 / SO = destination. Get pickup_date from PU block, origin/dest from addresses.
@@ -362,6 +400,11 @@ def extract_structured(raw_text: str) -> dict:
     payload["broker_name"] = broker_truck.get("broker_name")
     payload["truck_number"] = broker_truck.get("truck_number")
 
+    client = _re_client(raw_text)
+    for key in ("client_name", "client_address", "client_phone", "client_city", "client_state", "client_zip"):
+        if client.get(key):
+            payload[key] = client[key]
+
     return payload
 
 
@@ -390,6 +433,7 @@ _EXTRACT_PROMPT = """Extract from this OCR text from a freight invoice/BOL. Retu
 - destination_city, destination_state, destination_zip: from the address under SO 2 / SO / Delivery (below the PU block). Example: HIRAM, OH, 44234.
 - total_rate, amount_due (base cost for rate-per-mile), line_haul, rate_per_mile (if stated).
 - detention, lumper, factoring_fee (numbers), commodity, weight (integer lbs), equipment_type, broker_name, truck_number.
+- client_name (customer/client/payer name from the PDF), client_address, client_phone, client_city, client_state, client_zip if present.
 Miles are computed from the two places (origin/destination); rate_per_mile = cost / miles.
 
 Text:
@@ -403,6 +447,8 @@ def _parse_llm_json(content: str) -> dict | None:
         out = json.loads(content)
         out.setdefault("amount_due", None)
         out.setdefault("rate_per_mile", None)
+        for k in ("client_name", "client_address", "client_phone", "client_city", "client_state", "client_zip"):
+            out.setdefault(k, None)
         return out
     except json.JSONDecodeError:
         return None
@@ -595,6 +641,59 @@ def ensure_company(sb, name: str, company_type: str = "broker") -> str | None:
     return None
 
 
+def ensure_company_with_info(
+    sb,
+    name: str,
+    company_type: str = "shipper",
+    *,
+    address: str | None = None,
+    city: str | None = None,
+    state: str | None = None,
+    zip_code: str | None = None,
+    phone: str | None = None,
+) -> str | None:
+    """Upsert company by name and optionally update address/phone. Used for client from PDF. Returns company id."""
+    if not name or not name.strip():
+        return None
+    name = name.strip()[:200]
+    r = sb.table("companies").select("id").eq("name", name).eq("company_type", company_type).limit(1).execute()
+    if r.data and len(r.data) > 0:
+        cid = r.data[0]["id"]
+        updates = {}
+        if address is not None and address.strip():
+            updates["address"] = address.strip()[:300]
+        if city is not None and city.strip():
+            updates["city"] = city.strip()[:100]
+        if state is not None and state.strip():
+            updates["state"] = state.strip()[:2]
+        if zip_code is not None and zip_code.strip():
+            updates["zip"] = zip_code.strip()[:20]
+        if phone is not None and phone.strip():
+            updates["phone"] = phone.strip()[:30]
+        if updates:
+            updates["updated_at"] = datetime.now(timezone.utc).isoformat()
+            try:
+                sb.table("companies").update(updates).eq("id", cid).execute()
+            except Exception:
+                pass
+        return cid
+    row = {"name": name, "company_type": company_type}
+    if address and address.strip():
+        row["address"] = address.strip()[:300]
+    if city and city.strip():
+        row["city"] = city.strip()[:100]
+    if state and state.strip():
+        row["state"] = state.strip()[:2]
+    if zip_code and zip_code.strip():
+        row["zip"] = zip_code.strip()[:20]
+    if phone and phone.strip():
+        row["phone"] = phone.strip()[:30]
+    ins = sb.table("companies").insert(row).execute()
+    if ins.data and len(ins.data) > 0:
+        return ins.data[0]["id"]
+    return None
+
+
 def process_pdf(
     pdf_path: str,
     user_id: str | None,
@@ -675,6 +774,26 @@ def process_pdf(
         sb.table("documents").update({"status": "extracted", "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", doc_id).execute()
     except Exception:
         pass
+
+    # Upsert client company from PDF (name + address/phone) and store client_id in document metadata
+    client_id = None
+    if extracted.get("client_name"):
+        client_id = ensure_company_with_info(
+            sb,
+            extracted["client_name"],
+            "shipper",
+            address=extracted.get("client_address"),
+            city=extracted.get("client_city"),
+            state=extracted.get("client_state"),
+            zip_code=extracted.get("client_zip"),
+            phone=extracted.get("client_phone"),
+        )
+        if client_id:
+            metadata["client_id"] = str(client_id)
+            try:
+                sb.table("documents").update({"metadata": metadata, "updated_at": datetime.now(timezone.utc).isoformat()}).eq("id", doc_id).execute()
+            except Exception:
+                pass
 
     # Upsert broker company and create rate if we have lane + rate
     company_id = None
