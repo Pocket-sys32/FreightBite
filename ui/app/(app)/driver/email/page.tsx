@@ -10,7 +10,6 @@ import {
   Phone,
   AlertCircle,
   FileUp,
-  MessagesSquare,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { type BrokerContact, type Driver, type Leg } from "@/lib/mock-data"
@@ -19,18 +18,12 @@ import {
   fetchCurrentDriver,
   fetchDriverContacts,
   fetchLegs,
-  askOutreachAssistant,
   uploadOutreachDocument,
 } from "@/lib/backend-api"
 
 interface DraftEmail {
   subject: string
   body: string
-}
-
-interface ChatMessage {
-  role: "assistant" | "user"
-  text: string
 }
 
 function fileToBase64(file: File): Promise<string> {
@@ -64,14 +57,6 @@ export default function EmailOutreachPage() {
   const [copied, setCopied] = useState(false)
   const [uploading, setUploading] = useState(false)
   const [uploadNotice, setUploadNotice] = useState<string | null>(null)
-  const [chatQuestion, setChatQuestion] = useState("")
-  const [chatLoading, setChatLoading] = useState(false)
-  const [chatMessages, setChatMessages] = useState<ChatMessage[]>([
-    {
-      role: "assistant",
-      text: "Ask me who to contact first, what message angle to use, or which broker is best for this lane.",
-    },
-  ])
 
   const loadData = useCallback(async () => {
     setLoading(true)
@@ -211,30 +196,6 @@ export default function EmailOutreachPage() {
 
     setUploading(false)
     event.target.value = ""
-  }
-
-  const handleAskAssistant = async () => {
-    const question = chatQuestion.trim()
-    if (!question || chatLoading) return
-
-    setChatMessages((prev) => [...prev, { role: "user", text: question }])
-    setChatQuestion("")
-    setChatLoading(true)
-
-    try {
-      const response = await askOutreachAssistant({
-        question,
-        contacts,
-        gapLeg,
-        driver,
-      })
-      setChatMessages((prev) => [...prev, { role: "assistant", text: response.answer || "No answer returned." }])
-    } catch (chatError) {
-      const fallback = chatError instanceof Error ? chatError.message : "Failed to get outreach answer."
-      setChatMessages((prev) => [...prev, { role: "assistant", text: fallback }])
-    } finally {
-      setChatLoading(false)
-    }
   }
 
   const isSent = activeContact ? sentEmails.has(activeContact.id) : false
@@ -390,55 +351,6 @@ export default function EmailOutreachPage() {
               </div>
             </div>
           )}
-
-          <section className="rounded-2xl border border-border bg-card p-4 flex flex-col gap-3">
-            <div className="flex items-center gap-2">
-              <MessagesSquare className="h-4 w-4 text-primary" />
-              <p className="text-xs font-bold text-muted-foreground uppercase tracking-widest">Outreach Copilot</p>
-            </div>
-            <div className="rounded-xl border border-border bg-background/60 p-3 max-h-64 overflow-y-auto flex flex-col gap-2">
-              {chatMessages.map((message, index) => (
-                <div
-                  key={`${message.role}-${index}`}
-                  className={cn(
-                    "rounded-lg px-3 py-2 text-sm whitespace-pre-wrap",
-                    message.role === "assistant"
-                      ? "bg-secondary text-foreground"
-                      : "bg-primary/15 text-foreground self-end"
-                  )}
-                >
-                  {message.text}
-                </div>
-              ))}
-              {chatLoading && (
-                <div className="rounded-lg px-3 py-2 text-sm bg-secondary text-muted-foreground inline-flex items-center gap-2 w-fit">
-                  <Loader2 className="h-3.5 w-3.5 animate-spin" />
-                  Thinking...
-                </div>
-              )}
-            </div>
-            <div className="flex gap-2">
-              <input
-                value={chatQuestion}
-                onChange={(event) => setChatQuestion(event.target.value)}
-                onKeyDown={(event) => {
-                  if (event.key === "Enter") {
-                    event.preventDefault()
-                    void handleAskAssistant()
-                  }
-                }}
-                placeholder="Who should I contact first for this lane?"
-                className="flex-1 rounded-xl border border-border bg-background px-3 py-2.5 text-sm text-foreground placeholder:text-muted-foreground focus:outline-none focus:ring-2 focus:ring-primary/40"
-              />
-              <button
-                onClick={() => void handleAskAssistant()}
-                disabled={chatLoading || !chatQuestion.trim()}
-                className="rounded-xl bg-primary text-primary-foreground px-4 py-2.5 text-sm font-bold disabled:opacity-60"
-              >
-                Ask
-              </button>
-            </div>
-          </section>
 
           <div className="rounded-2xl border border-border overflow-hidden">
             <div className="bg-card border-b border-border px-5 py-4">

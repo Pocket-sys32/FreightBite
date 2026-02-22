@@ -1,12 +1,24 @@
-require('dotenv').config({ path: '.env.local' });
-require('dotenv').config();
+const path = require('path');
+const fs = require('fs');
+
+require('dotenv').config({ path: path.join(__dirname, '.env.local') });
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+
+// Force OPENAI_API_KEY from project-root .env.local only (no other .env can override)
+const envLocalPath = path.join(__dirname, '.env.local');
+if (fs.existsSync(envLocalPath)) {
+  const content = fs.readFileSync(envLocalPath, 'utf8');
+  const match = content.match(/^\s*OPENAI_API_KEY\s*=\s*(.+?)\s*$/m);
+  if (match) {
+    const value = match[1].replace(/^["']|["']$/g, '').trim();
+    if (value) process.env.OPENAI_API_KEY = value;
+  }
+}
 
 const express = require('express');
 const http = require('http');
-const fs = require('fs');
 const fsp = require('fs/promises');
 const os = require('os');
-const path = require('path');
 const { spawn } = require('child_process');
 const { EventEmitter } = require('events');
 const { Server } = require('socket.io');
@@ -28,6 +40,7 @@ const { generateMatchExplanation } = require('./lib/ai/match-explanation');
 const { draftBrokerEmail } = require('./lib/ai/email-drafter');
 const { getRecommendation } = require('./lib/ai/whats-next');
 const { answerOutreachQuestion } = require('./lib/ai/outreach-chat');
+const { getSupabaseContext } = require('./lib/ai/supabase-context');
 
 const app = express();
 app.use(express.json({ limit: '25mb' }));
@@ -554,12 +567,16 @@ app.post('/api/ai/outreach-chat', async (req, res) => {
       return res.status(400).json({ error: 'question is required' });
     }
 
+    const sb = supabaseAdmin || supabase;
+    const supabaseContext = sb ? await getSupabaseContext(sb) : '';
+
     try {
       const answer = await answerOutreachQuestion({
         question: String(question).trim(),
         contacts: Array.isArray(contacts) ? contacts : [],
         gapLeg: gapLeg || null,
         driver: driver || null,
+        supabaseContext,
       });
       return res.json({ answer });
     } catch (aiError) {
@@ -580,9 +597,15 @@ app.post('/api/ai/outreach-chat', async (req, res) => {
 
 app.post('/api/ai/whats-next', async (req, res) => {
   try {
-    const { driver, nearbyLoads } = req.body;
+    const { driver, nearbyLoads, distanceFromHomeMiles, stayLoad, homeLoad } = req.body;
     if (!driver) return res.status(400).json({ error: 'driver is required' });
-    const recommendation = await getRecommendation({ driver, nearbyLoads: nearbyLoads || [] });
+    const recommendation = await getRecommendation({
+      driver,
+      nearbyLoads: nearbyLoads || [],
+      distanceFromHomeMiles: distanceFromHomeMiles ?? undefined,
+      stayLoad: stayLoad || undefined,
+      homeLoad: homeLoad || undefined,
+    });
     res.json(recommendation);
   } catch (err) {
     res.status(500).json({ error: err.message });

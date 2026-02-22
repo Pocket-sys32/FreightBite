@@ -500,7 +500,40 @@ function mapContact(raw: RawContact): BrokerContact {
   }
 }
 
-async function geocodeAddress(input: string): Promise<{ lat: number; lng: number; label: string } | null> {
+/** Reverse geocode lat/lng to a short city label (e.g. "Manteca, CA") for display. */
+export async function reverseGeocode(lat: number, lng: number): Promise<string | null> {
+  if (!GOOGLE_MAPS_API_KEY) return null
+
+  const params = new URLSearchParams({
+    latlng: `${lat},${lng}`,
+    key: GOOGLE_MAPS_API_KEY,
+  })
+
+  try {
+    const response = await fetch(`https://maps.googleapis.com/maps/api/geocode/json?${params.toString()}`)
+    if (!response.ok) return null
+
+    const payload = (await response.json()) as {
+      status?: string
+      results?: Array<{
+        address_components?: Array<{ long_name: string; short_name: string; types: string[] }>
+        formatted_address?: string
+      }>
+    }
+    if (payload.status !== "OK" || !payload.results?.length) return null
+
+    const comp = payload.results[0].address_components || []
+    const locality = comp.find((c) => c.types.includes("locality"))?.long_name
+    const state = comp.find((c) => c.types.includes("administrative_area_level_1"))?.short_name
+    if (locality && state) return `${locality}, ${state}`
+    if (locality) return locality
+    return payload.results[0].formatted_address || null
+  } catch {
+    return null
+  }
+}
+
+export async function geocodeAddress(input: string): Promise<{ lat: number; lng: number; label: string } | null> {
   if (!GOOGLE_MAPS_API_KEY) return null
 
   const params = new URLSearchParams({
@@ -806,7 +839,15 @@ export function legsToNearbyLoads(legs: Leg[]): NearbyLoad[] {
   }))
 }
 
-export async function fetchWhatsNextRecommendation(driver: Driver, nearbyLoads: NearbyLoad[]) {
+export async function fetchWhatsNextRecommendation(
+  driver: Driver,
+  nearbyLoads: NearbyLoad[],
+  options?: {
+    distanceFromHomeMiles?: number | null
+    stayLoad?: NearbyLoad | null
+    homeLoad?: NearbyLoad | null
+  }
+) {
   return apiFetch<{ recommendation?: string; topLoad?: NearbyLoad | null; reasoning?: string }>(
     "/api/ai/whats-next",
     {
@@ -818,6 +859,9 @@ export async function fetchWhatsNextRecommendation(driver: Driver, nearbyLoads: 
           homeMilesAway: Math.max(80, Math.round(driver.hosRemainingHours * 45)),
         },
         nearbyLoads,
+        distanceFromHomeMiles: options?.distanceFromHomeMiles ?? undefined,
+        stayLoad: options?.stayLoad ?? undefined,
+        homeLoad: options?.homeLoad ?? undefined,
       }),
     }
   )

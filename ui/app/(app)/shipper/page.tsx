@@ -219,7 +219,7 @@ export default function ShipperPortalPage() {
             </div>
           </div>
 
-          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-5">
+          <div className="grid gap-4 grid-cols-2 sm:grid-cols-3 lg:grid-cols-5">
             {[
               { icon: Route, value: load.miles.toLocaleString(), unit: "mi", label: "Total Miles" },
               { icon: Truck, value: String(load.legs.length), unit: "legs", label: "Relay Legs" },
@@ -235,12 +235,6 @@ export default function ShipperPortalPage() {
                 value: `$${(summary.contractTotal / 100).toLocaleString()}`,
                 unit: "",
                 label: "Contract Total",
-              },
-              {
-                icon: DollarSign,
-                value: `$${(summary.totalRate / 100).toLocaleString()}`,
-                unit: "",
-                label: "All-In (w/ FSC)",
               },
             ].map((stat) => (
               <div key={stat.label} className="rounded-2xl border border-border bg-card p-5">

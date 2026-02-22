@@ -13,7 +13,6 @@ import {
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { DriverMap } from "@/components/driver-map"
-import { LegRouteDirections } from "@/components/leg-route-directions"
 import { LegCard } from "@/components/leg-card"
 import { cn } from "@/lib/utils"
 import { type Driver, HOS_RULES, type Leg } from "@/lib/mock-data"
@@ -705,32 +704,6 @@ export default function DriverDashboardPage() {
           </div>
         )}
       </section>
-
-      {selectedLeg && (
-        <section className="rounded-2xl border border-border bg-card p-5 flex flex-col gap-4">
-          <div className="flex items-start justify-between gap-3">
-            <div>
-              <h2 className="text-base font-semibold text-foreground">Directions to Next Location</h2>
-              <p className="text-xs text-muted-foreground">
-                Leg {selectedLeg.sequence} · Current location to pickup/transfer, then pickup to drop
-              </p>
-            </div>
-            {driver && (
-              <Link className="text-xs text-primary font-semibold" href={`/driver/route/${selectedLeg.id}`}>
-                Get Directions
-              </Link>
-            )}
-          </div>
-
-          {driver ? (
-            <LegRouteDirections
-              driver={driver}
-              leg={selectedLeg}
-              onDistanceMilesChange={setDistanceToDropMiles}
-            />
-          ) : null}
-        </section>
-      )}
 
       <section className="flex flex-col gap-4">
         <div className="flex items-center justify-between">
