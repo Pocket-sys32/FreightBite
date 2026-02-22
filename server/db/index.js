@@ -11,6 +11,7 @@ const LEG_EVENT_TYPES = new Set([
   'START_ROUTE',
   'ARRIVED',
   'HANDOFF_READY',
+  'HANDOFF_NOTIFIED',
   'HANDOFF_COMPLETE',
   'AUTO_START_ROUTE'
 ]);
@@ -52,6 +53,8 @@ CREATE TABLE IF NOT EXISTS legs (
   sequence INTEGER NOT NULL,
   origin TEXT NOT NULL,
   destination TEXT NOT NULL,
+  origin_address TEXT,
+  destination_address TEXT,
   miles NUMERIC NOT NULL,
   handoff_point TEXT,
   rate_cents INTEGER NOT NULL,
@@ -135,6 +138,11 @@ async function getSqliteDb() {
 
   sqliteDb = await open({ filename: sqlitePath, driver: sqlite3.Database });
   await sqliteDb.exec(SQLITE_SCHEMA);
+
+  // Migrate existing DBs: add address columns if missing
+  try { await sqliteDb.exec('ALTER TABLE legs ADD COLUMN origin_address TEXT'); } catch (_) { /* already exists */ }
+  try { await sqliteDb.exec('ALTER TABLE legs ADD COLUMN destination_address TEXT'); } catch (_) { /* already exists */ }
+
   return sqliteDb;
 }
 
@@ -184,6 +192,8 @@ async function createLegs(legs) {
       sequence: leg.sequence,
       origin: leg.origin,
       destination: leg.destination,
+      origin_address: leg.origin_address || null,
+      destination_address: leg.destination_address || null,
       miles: leg.miles,
       handoff_point: leg.handoff_point || null,
       rate_cents: leg.rate_cents,
@@ -212,14 +222,16 @@ async function createLegs(legs) {
     for (const leg of payload) {
       await db.run(
         `INSERT INTO legs
-        (id, load_id, sequence, origin, destination, miles, handoff_point, rate_cents, status, driver_id)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        (id, load_id, sequence, origin, destination, origin_address, destination_address, miles, handoff_point, rate_cents, status, driver_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         [
           leg.id,
           leg.load_id,
           leg.sequence,
           leg.origin,
           leg.destination,
+          leg.origin_address,
+          leg.destination_address,
           leg.miles,
           leg.handoff_point,
           leg.rate_cents,
@@ -765,6 +777,42 @@ async function listLegs({ status, loadId, driverId, limit = 100 } = {}) {
   return db.all(sql, params);
 }
 
+async function listLegsForDriver(driverId, { status, loadId, limit } = {}) {
+  const safeLimit = Math.max(1, Math.min(Number(limit) || 100, 500));
+
+  if (useSupabase) {
+    let query = supabase
+      .from('legs')
+      .select('*')
+      .or(`and(driver_id.is.null,status.eq.OPEN),driver_id.eq.${driverId}`)
+      .order('sequence', { ascending: true });
+
+    if (status) query = query.eq('status', status);
+    if (loadId) query = query.eq('load_id', loadId);
+    query = query.limit(safeLimit);
+
+    const { data, error } = await query;
+    if (error) {
+      throw error;
+    }
+
+    return data || [];
+  }
+
+  const db = await getSqliteDb();
+
+  // Base condition: unassigned OPEN legs OR this driver's legs
+  let sql = `SELECT * FROM legs WHERE ((driver_id IS NULL AND status = 'OPEN') OR driver_id = ?)`;
+  const params = [driverId];
+
+  if (status) { sql += ' AND status = ?'; params.push(status); }
+  if (loadId) { sql += ' AND load_id = ?'; params.push(loadId); }
+  sql += ' ORDER BY sequence ASC LIMIT ?';
+  params.push(safeLimit);
+
+  return db.all(sql, params);
+}
+
 async function listLegsByLoad(loadId) {
   return listLegs({ loadId, limit: 500 });
 }
@@ -913,6 +961,7 @@ module.exports = {
   getDriverByAccountEmail,
   listLoads,
   listLegs,
+  listLegsForDriver,
   listLegsByLoad,
   updateLegStatus,
   createLegEvent,

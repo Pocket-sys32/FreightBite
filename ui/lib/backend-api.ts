@@ -53,6 +53,8 @@ interface RawLeg {
   rate_cents?: number
   status?: string
   driver_id?: string | null
+  origin_address?: string | null
+  destination_address?: string | null
 }
 
 interface RawDriver {
@@ -348,8 +350,10 @@ function mapLeg(raw: RawLeg, driverNameById: Map<string, string>): Leg {
     sequence,
     origin,
     originState: stateFromLabel(origin),
+    originAddress: raw.origin_address || pointLabel(raw.origin, "Origin"),
     destination,
     destinationState: stateFromLabel(destination),
+    destinationAddress: raw.destination_address || pointLabel(raw.destination, "Destination"),
     miles,
     deadheadMiles: 0,
     handoffPoint,

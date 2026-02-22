@@ -21,9 +21,30 @@ const haversineMiles = (pointA, pointB) => haversineMeters(pointA, pointB) * MET
 const metersToMiles = (meters) => meters * METERS_TO_MILES;
 const roundMiles = (miles) => Number(miles.toFixed(1));
 
+let lastGeoTime = 0;
+
+const reverseGeocode = async (lat, lng) => {
+  const now = Date.now();
+  const wait = Math.max(0, 1100 - (now - lastGeoTime));
+  if (wait > 0) await new Promise(r => setTimeout(r, wait));
+  lastGeoTime = Date.now();
+
+  try {
+    const url = `https://nominatim.openstreetmap.org/reverse?lat=${lat}&lon=${lng}&format=json&addressdetails=1`;
+    const response = await fetch(url, {
+      headers: { 'User-Agent': 'FreightBite/1.0' }
+    });
+    const data = await response.json();
+    return data.display_name;
+  } catch (error) {
+    return `${lat.toFixed(4)}, ${lng.toFixed(4)}`;
+  }
+};
+
 module.exports = {
   haversineMeters,
   haversineMiles,
   metersToMiles,
-  roundMiles
+  roundMiles,
+  reverseGeocode
 };

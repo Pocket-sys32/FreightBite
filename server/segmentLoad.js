@@ -1,5 +1,5 @@
 const { TRUCK_STOPS } = require('./truckStops');
-const { haversineMeters, metersToMiles, roundMiles } = require('./geo');
+const { haversineMeters, metersToMiles, roundMiles, reverseGeocode } = require('./geo');
 
 const buildOsrmUrl = (origin, destination) => {
   const originPart = `${origin.lng},${origin.lat}`;
@@ -162,6 +162,13 @@ const segmentLoad = async (origin, destination) => {
       },
       status: 'OPEN'
     });
+  }
+
+  for (const leg of legs) {
+    const originPoint = typeof leg.origin === 'string' ? JSON.parse(leg.origin) : leg.origin;
+    const destPoint = typeof leg.destination === 'string' ? JSON.parse(leg.destination) : leg.destination;
+    leg.origin_address = await reverseGeocode(originPoint.lat, originPoint.lng);
+    leg.destination_address = await reverseGeocode(destPoint.lat, destPoint.lng);
   }
 
   return {
