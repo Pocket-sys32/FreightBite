@@ -1,0 +1,10 @@
+{
+  "extends": "expo/tsconfig.base",
+  "compilerOptions": {
+    "strict": true,
+    "noEmit": true,
+    "target": "ES2021",
+    "moduleResolution": "Bundler"
+  },
+  "include": ["src", "App.tsx", "index.js"]
+}

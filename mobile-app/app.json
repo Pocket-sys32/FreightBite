@@ -1,0 +1,31 @@
+{
+  "expo": {
+    "name": "FreightBite Mobile",
+    "slug": "freightbite-mobile",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "userInterfaceStyle": "dark",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.freightbite.mobile",
+      "infoPlist": {
+        "NSLocationWhenInUseUsageDescription": "FreightBite uses your location for live route tracking and handoff proximity checks."
+      }
+    },
+    "android": {
+      "package": "com.freightbite.mobile",
+      "permissions": [
+        "ACCESS_COARSE_LOCATION",
+        "ACCESS_FINE_LOCATION"
+      ]
+    },
+    "plugins": [
+      "expo-location"
+    ],
+    "extra": {
+      "apiOrigin": "${EXPO_PUBLIC_API_ORIGIN}",
+      "googleMapsApiKey": "${EXPO_PUBLIC_GOOGLE_MAPS_API_KEY}",
+      "handoffRadiusMiles": "${EXPO_PUBLIC_HANDOFF_COMPLETION_RADIUS_MILES}"
+    }
+  }
+}
