@@ -1,18 +1,19 @@
 "use client"
 
-import { useCallback, useEffect, useMemo, useState } from "react"
+import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import Link from "next/link"
 import {
   AlertCircle,
   CheckCircle2,
   Loader2,
   MapPin,
-  Navigation,
   PlayCircle,
   SlidersHorizontal,
   Wifi,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
 import { DriverMap } from "@/components/driver-map"
+import { LegRouteDirections } from "@/components/leg-route-directions"
 import { LegCard } from "@/components/leg-card"
 import { cn } from "@/lib/utils"
 import { type Driver, HOS_RULES, type Leg } from "@/lib/mock-data"
@@ -20,14 +21,22 @@ import {
   acceptLeg,
   arriveAtLegStop,
   fetchCurrentDriver,
-  fetchLegDirections,
   fetchLegWorkflow,
   fetchLegs,
   finishLegHandoff,
+  pauseLegRoute,
+  resumeLegRoute,
   startLegRoute,
-  type LegDirections,
+  updateDriverLiveLocation,
+  type LegEvent,
   type LegWorkflow,
 } from "@/lib/backend-api"
+
+const HANDOFF_COMPLETION_RADIUS_MILES = Number(process.env.NEXT_PUBLIC_HANDOFF_COMPLETION_RADIUS_MILES || 0.25)
+const DRIVE_START_EVENTS = new Set(["START_ROUTE", "AUTO_START_ROUTE", "RESUME_ROUTE"])
+const DRIVE_STOP_EVENTS = new Set(["PAUSE_ROUTE", "ARRIVED", "HANDOFF_COMPLETE"])
+const TEN_HOURS_MS = 10 * 60 * 60 * 1000
+const CYCLE_WINDOW_MS = 8 * 24 * 60 * 60 * 1000
 
 function hosColor(hours: number) {
   if (hours >= 8) return "text-success"
@@ -63,10 +72,79 @@ function phaseLabel(phase: string | undefined) {
       return "Handoff Complete"
     case "AUTO_START_ROUTE":
       return "Auto-Started"
+    case "PAUSE_ROUTE":
+      return "Paused"
+    case "RESUME_ROUTE":
+      return "Resumed"
     case "OPEN":
       return "Open"
     default:
       return "Pending"
+  }
+}
+
+function legDriveState(leg: Leg, workflow?: LegWorkflow): "DRIVING" | "PAUSED" | "IDLE" {
+  if (leg.status !== "IN_TRANSIT") return "IDLE"
+  const phase = (workflow?.phase || "").toUpperCase()
+  if (phase === "PAUSE_ROUTE") return "PAUSED"
+  if (DRIVE_START_EVENTS.has(phase)) return "DRIVING"
+  return "IDLE"
+}
+
+function intersectWindow(start: number, end: number, windowStart: number, windowEnd: number) {
+  const from = Math.max(start, windowStart)
+  const to = Math.min(end, windowEnd)
+  return Math.max(0, to - from)
+}
+
+function computeHosUsage(events: LegEvent[], nowMs: number) {
+  const sorted = [...events]
+    .filter((event) => !!event.createdAt)
+    .sort((a, b) => new Date(a.createdAt || 0).getTime() - new Date(b.createdAt || 0).getTime())
+
+  const intervals: Array<{ start: number; end: number }> = []
+  let activeStart: number | null = null
+
+  for (const event of sorted) {
+    const ts = new Date(event.createdAt || 0).getTime()
+    if (!Number.isFinite(ts)) continue
+    if (DRIVE_START_EVENTS.has(event.eventType)) {
+      if (activeStart === null) activeStart = ts
+      continue
+    }
+    if (DRIVE_STOP_EVENTS.has(event.eventType)) {
+      if (activeStart !== null && ts > activeStart) {
+        intervals.push({ start: activeStart, end: ts })
+      }
+      activeStart = null
+    }
+  }
+
+  if (activeStart !== null && nowMs > activeStart) {
+    intervals.push({ start: activeStart, end: nowMs })
+  }
+
+  let cycleMs = 0
+  const cycleStart = nowMs - CYCLE_WINDOW_MS
+  for (const interval of intervals) {
+    cycleMs += intersectWindow(interval.start, interval.end, cycleStart, nowMs)
+  }
+
+  let shiftStartIdx = 0
+  for (let index = 1; index < intervals.length; index += 1) {
+    if (intervals[index].start - intervals[index - 1].end >= TEN_HOURS_MS) {
+      shiftStartIdx = index
+    }
+  }
+  let shiftMs = 0
+  for (let index = shiftStartIdx; index < intervals.length; index += 1) {
+    shiftMs += Math.max(0, intervals[index].end - intervals[index].start)
+  }
+
+  return {
+    shiftHours: Number((shiftMs / (60 * 60 * 1000)).toFixed(2)),
+    cycleHours: Number((cycleMs / (60 * 60 * 1000)).toFixed(2)),
+    activelyDriving: activeStart !== null,
   }
 }
 
@@ -75,7 +153,8 @@ function nextLegAction(leg: Leg, workflow?: LegWorkflow): "START_ROUTE" | "ARRIV
   const phase = (workflow?.phase || "").toUpperCase()
 
   if (phase === "ARRIVED") return "HANDOFF"
-  if (phase === "START_ROUTE") return "ARRIVE"
+  if (phase === "START_ROUTE" || phase === "AUTO_START_ROUTE" || phase === "RESUME_ROUTE") return "ARRIVE"
+  if (phase === "PAUSE_ROUTE") return null
   if (phase === "HANDOFF_COMPLETE") return null
   return "START_ROUTE"
 }
@@ -86,24 +165,25 @@ function actionLabel(action: "START_ROUTE" | "ARRIVE" | "HANDOFF") {
   return "Finish Handoff"
 }
 
-function fmtLatLng(lat: number, lng: number) {
-  return `${lat.toFixed(5)}, ${lng.toFixed(5)}`
-}
-
 export default function DriverDashboardPage() {
   const [driver, setDriver] = useState<Driver | null>(null)
   const [openLegs, setOpenLegs] = useState<Leg[]>([])
   const [myLegs, setMyLegs] = useState<Leg[]>([])
   const [workflowByLeg, setWorkflowByLeg] = useState<Record<string, LegWorkflow>>({})
   const [selectedLegId, setSelectedLegId] = useState<string | null>(null)
-  const [directions, setDirections] = useState<LegDirections | null>(null)
+  const [distanceToDropMiles, setDistanceToDropMiles] = useState<number | null>(null)
+  const [livePosition, setLivePosition] = useState<{ lat: number; lng: number } | null>(null)
   const [filter, setFilter] = useState<"all" | "nearby" | "high-pay">("all")
   const [loading, setLoading] = useState(true)
-  const [loadingDirections, setLoadingDirections] = useState(false)
   const [actionKey, setActionKey] = useState<string | null>(null)
   const [confirmHandoffLegId, setConfirmHandoffLegId] = useState<string | null>(null)
+  const [gpsStatus, setGpsStatus] = useState<"idle" | "watching" | "unsupported" | "blocked">("idle")
+  const [gpsError, setGpsError] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
+  const [hosNowMs, setHosNowMs] = useState(() => Date.now())
+  const lastGpsSendAtRef = useRef(0)
+  const gpsUpdateInFlightRef = useRef(false)
 
   const loadBoard = useCallback(
     async (focusLegId?: string) => {
@@ -122,7 +202,9 @@ export default function DriverDashboardPage() {
           fetchLegs({ driverId: currentDriver.id }),
         ])
 
-        const sortedClaimed = [...claimedLegs].sort((a, b) => a.sequence - b.sequence)
+        const sortedClaimed = [...claimedLegs]
+          .sort((a, b) => a.sequence - b.sequence)
+        const activeClaimed = sortedClaimed.filter((leg) => leg.status !== "COMPLETED")
         const workflowEntries = await Promise.all(
           sortedClaimed.map(async (leg) => {
             try {
@@ -141,14 +223,15 @@ export default function DriverDashboardPage() {
 
         setDriver(currentDriver)
         setOpenLegs(availableLegs)
-        setMyLegs(sortedClaimed)
+        setMyLegs(activeClaimed)
         setWorkflowByLeg(nextWorkflowByLeg)
+        setHosNowMs(Date.now())
 
         setSelectedLegId((previous) => {
-          if (focusLegId && sortedClaimed.some((leg) => leg.id === focusLegId)) return focusLegId
-          if (previous && sortedClaimed.some((leg) => leg.id === previous)) return previous
-          const activeLeg = sortedClaimed.find((leg) => leg.status === "IN_TRANSIT")
-          return activeLeg?.id || sortedClaimed[0]?.id || null
+          if (focusLegId && activeClaimed.some((leg) => leg.id === focusLegId)) return focusLegId
+          if (previous && activeClaimed.some((leg) => leg.id === previous)) return previous
+          const activeLeg = activeClaimed.find((leg) => leg.status === "IN_TRANSIT")
+          return activeLeg?.id || activeClaimed[0]?.id || null
         })
       } catch (loadError) {
         const message = loadError instanceof Error ? loadError.message : "Failed to load driver board"
@@ -165,35 +248,84 @@ export default function DriverDashboardPage() {
   }, [loadBoard])
 
   useEffect(() => {
-    let active = true
+    setDistanceToDropMiles(null)
+  }, [selectedLegId])
 
-    const loadDirections = async () => {
-      if (!driver || !selectedLegId) {
-        setDirections(null)
-        return
-      }
-
-      setLoadingDirections(true)
-      try {
-        const nextDirections = await fetchLegDirections(selectedLegId, driver.id)
-        if (!active) return
-        setDirections(nextDirections)
-      } catch (directionsError) {
-        if (!active) return
-        const message = directionsError instanceof Error ? directionsError.message : "Failed to load directions"
-        setError(message)
-        setDirections(null)
-      } finally {
-        if (active) setLoadingDirections(false)
-      }
+  useEffect(() => {
+    if (!driver?.id) return
+    if (typeof window === "undefined" || !window.navigator?.geolocation) {
+      setGpsStatus("unsupported")
+      setGpsError("GPS is not supported on this device.")
+      return
     }
 
-    void loadDirections()
+    let cancelled = false
+    setGpsStatus("watching")
+    setGpsError(null)
+
+    const watchId = window.navigator.geolocation.watchPosition(
+      (position) => {
+        const lat = position.coords.latitude
+        const lng = position.coords.longitude
+        const accuracy = position.coords.accuracy
+
+        setDriver((previous) => (previous ? { ...previous, currentLat: lat, currentLng: lng } : previous))
+        setLivePosition({ lat, lng })
+
+        const now = Date.now()
+        if (gpsUpdateInFlightRef.current) return
+        if (now - lastGpsSendAtRef.current < 5000) return
+
+        gpsUpdateInFlightRef.current = true
+        lastGpsSendAtRef.current = now
+        void updateDriverLiveLocation({ lat, lng, accuracy })
+          .then((updated) => {
+            if (cancelled) return
+            setDriver(updated)
+            setGpsStatus("watching")
+            setGpsError(null)
+          })
+          .catch((gpsUpdateError) => {
+            if (cancelled) return
+            setGpsError(gpsUpdateError instanceof Error ? gpsUpdateError.message : "Failed to sync live GPS")
+          })
+          .finally(() => {
+            gpsUpdateInFlightRef.current = false
+          })
+      },
+      (geoError) => {
+        if (cancelled) return
+        setGpsStatus("blocked")
+        setGpsError(geoError?.message || "Location permission denied.")
+      },
+      {
+        enableHighAccuracy: true,
+        maximumAge: 5000,
+        timeout: 15000,
+      }
+    )
 
     return () => {
-      active = false
+      cancelled = true
+      window.navigator.geolocation.clearWatch(watchId)
     }
-  }, [driver, selectedLegId])
+  }, [driver?.id])
+
+  const allLegEvents = useMemo(
+    () =>
+      Object.values(workflowByLeg)
+        .flatMap((workflow) => workflow.events || [])
+        .filter((event) => !driver?.id || event.driverId === driver.id),
+    [driver?.id, workflowByLeg]
+  )
+
+  const hosUsage = useMemo(() => computeHosUsage(allLegEvents, hosNowMs), [allLegEvents, hosNowMs])
+
+  useEffect(() => {
+    if (!hosUsage.activelyDriving) return
+    const intervalId = window.setInterval(() => setHosNowMs(Date.now()), 15000)
+    return () => window.clearInterval(intervalId)
+  }, [hosUsage.activelyDriving])
 
   const handleAccept = useCallback(
     async (leg: Leg) => {
@@ -224,6 +356,23 @@ export default function DriverDashboardPage() {
       if (!action) return
 
       if (action === "HANDOFF") {
+        if (leg.id !== selectedLegId) {
+          setSelectedLegId(leg.id)
+          setNotice("Open the selected leg route and get within the drop-zone radius before finishing handoff.")
+          return
+        }
+        if (distanceToDropMiles === null) {
+          setNotice("Waiting for live GPS distance to drop zone...")
+          return
+        }
+        if (distanceToDropMiles > HANDOFF_COMPLETION_RADIUS_MILES) {
+          setError(
+            `You are ${distanceToDropMiles.toFixed(2)} mi away. Move within ${HANDOFF_COMPLETION_RADIUS_MILES.toFixed(
+              2
+            )} mi to finish handoff.`
+          )
+          return
+        }
         if (confirmHandoffLegId !== leg.id) {
           setConfirmHandoffLegId(leg.id)
           return
@@ -244,7 +393,10 @@ export default function DriverDashboardPage() {
           setNotice(`Arrival confirmed for leg ${leg.sequence}.`)
           await loadBoard(leg.id)
         } else {
-          const completed = await finishLegHandoff(leg.id, driver.id)
+          const completed = await finishLegHandoff(leg.id, driver.id, {
+            currentLat: driver.currentLat,
+            currentLng: driver.currentLng,
+          })
           const nextLegId = completed.autoStartedNextLeg?.id || workflow?.nextLeg?.id || null
           setNotice(nextLegId ? "Handoff completed and next connected leg is now active." : "Handoff completed.")
           await loadBoard(nextLegId || undefined)
@@ -256,7 +408,38 @@ export default function DriverDashboardPage() {
         setActionKey(null)
       }
     },
-    [confirmHandoffLegId, driver, loadBoard, workflowByLeg]
+    [confirmHandoffLegId, distanceToDropMiles, driver, loadBoard, selectedLegId, workflowByLeg]
+  )
+
+  const handlePauseToggle = useCallback(
+    async (leg: Leg) => {
+      if (!driver) return
+
+      const workflow = workflowByLeg[leg.id]
+      const driveState = legDriveState(leg, workflow)
+      if (driveState === "IDLE") return
+
+      const nextAction = driveState === "PAUSED" ? "RESUME" : "PAUSE"
+      setActionKey(`${nextAction}-${leg.id}`)
+      setError(null)
+
+      try {
+        if (nextAction === "PAUSE") {
+          await pauseLegRoute(leg.id, driver.id)
+          setNotice("Drive paused. HOS will stay frozen until you resume.")
+        } else {
+          await resumeLegRoute(leg.id, driver.id)
+          setNotice("Drive resumed. HOS tracking is active again.")
+        }
+        await loadBoard(leg.id)
+      } catch (pauseError) {
+        const message = pauseError instanceof Error ? pauseError.message : "Failed to update drive pause state"
+        setError(message)
+      } finally {
+        setActionKey(null)
+      }
+    },
+    [driver, loadBoard, workflowByLeg]
   )
 
   const filteredOpenLegs = useMemo(
@@ -272,36 +455,38 @@ export default function DriverDashboardPage() {
   const selectedLeg = myLegs.find((leg) => leg.id === selectedLegId) || null
   const selectedWorkflow = selectedLeg ? workflowByLeg[selectedLeg.id] : undefined
 
-  const cycleRemaining = driver ? Math.max(0, HOS_RULES.maxCycleHours - driver.hosCycleUsed) : 0
+  const shiftUsed = Math.min(HOS_RULES.maxDrivingHours, hosUsage.shiftHours)
+  const cycleUsed = Math.min(HOS_RULES.maxCycleHours, hosUsage.cycleHours)
+  const shiftRemaining = Math.max(0, HOS_RULES.maxDrivingHours - shiftUsed)
 
   return (
     <div className="flex flex-col gap-6">
       <div className="rounded-2xl bg-card border border-border p-5">
         <div className="flex items-center justify-between mb-3">
           <span className="text-xs font-semibold text-muted-foreground uppercase tracking-widest">Hours of Service</span>
-          <span className={`text-xs font-bold uppercase tracking-widest ${hosColor(driver?.hosRemainingHours || 0)}`}>
-            {(driver?.hosRemainingHours || 0) >= 8 ? "Good" : (driver?.hosRemainingHours || 0) >= 5 ? "Limited" : "Critical"}
+          <span className={`text-xs font-bold uppercase tracking-widest ${hosColor(shiftRemaining)}`}>
+            {hosUsage.activelyDriving ? "Driving" : "Paused / Off Duty"}
           </span>
         </div>
 
         <div className="flex items-baseline gap-2 mb-2">
-          <span className={`text-5xl font-bold tabular-nums tracking-tight ${hosColor(driver?.hosRemainingHours || 0)}`}>
-            {driver?.hosRemainingHours ?? 0}
+          <span className={`text-5xl font-bold tabular-nums tracking-tight ${hosColor(shiftRemaining)}`}>
+            {shiftUsed.toFixed(1)}
           </span>
-          <span className="text-lg text-muted-foreground font-medium">of {HOS_RULES.maxDrivingHours} hrs drive time</span>
+          <span className="text-lg text-muted-foreground font-medium">/ {HOS_RULES.maxDrivingHours} hrs driving</span>
         </div>
 
         <div className="relative h-3 w-full rounded-full bg-secondary overflow-hidden mb-4">
-          <div className={`absolute inset-y-0 left-0 rounded-full transition-all duration-500 ${hosBg(driver?.hosRemainingHours || 0)}`} style={{ width: `${hosBarPct(driver?.hosRemainingHours || 0)}%` }} />
+          <div className={`absolute inset-y-0 left-0 rounded-full transition-all duration-500 ${hosBg(shiftRemaining)}`} style={{ width: `${hosBarPct(shiftUsed)}%` }} />
         </div>
 
         <div className="flex items-center justify-between mb-1.5">
           <span className="text-[10px] text-muted-foreground uppercase tracking-wider font-semibold">70-hr / 8-day cycle</span>
-          <span className="text-xs text-muted-foreground tabular-nums">{cycleRemaining.toFixed(1)} hrs remaining</span>
+          <span className="text-xs text-muted-foreground tabular-nums">{cycleUsed.toFixed(1)} / {HOS_RULES.maxCycleHours} hrs</span>
         </div>
 
         <div className="relative h-2 w-full rounded-full bg-secondary overflow-hidden mb-4">
-          <div className="absolute inset-y-0 left-0 rounded-full bg-primary/60 transition-all duration-500" style={{ width: `${cycleBarPct(driver?.hosCycleUsed || 0)}%` }} />
+          <div className="absolute inset-y-0 left-0 rounded-full bg-primary/60 transition-all duration-500" style={{ width: `${cycleBarPct(cycleUsed)}%` }} />
         </div>
 
         <div className="flex flex-wrap items-center gap-x-4 gap-y-1 text-xs text-muted-foreground">
@@ -324,6 +509,19 @@ export default function DriverDashboardPage() {
         </span>
       </div>
 
+      <div className="flex items-center gap-2 px-1">
+        <MapPin className={`h-3 w-3 ${gpsStatus === "watching" ? "text-success" : "text-warning"}`} />
+        <span className="text-[10px] text-muted-foreground">
+          {gpsStatus === "watching"
+            ? "Live GPS active"
+            : gpsStatus === "unsupported"
+            ? "GPS unsupported on this device"
+            : gpsStatus === "blocked"
+            ? "GPS blocked - allow location for route completion"
+            : "GPS not started"}
+        </span>
+      </div>
+
       {error && (
         <div className="rounded-xl border border-destructive/25 bg-destructive/10 p-3 text-sm text-destructive flex items-center gap-2">
           <AlertCircle className="h-4 w-4" />
@@ -335,6 +533,13 @@ export default function DriverDashboardPage() {
         <div className="rounded-xl border border-success/30 bg-success/10 p-3 text-sm text-success flex items-center gap-2">
           <CheckCircle2 className="h-4 w-4" />
           <span>{notice}</span>
+        </div>
+      )}
+
+      {gpsError && (
+        <div className="rounded-xl border border-warning/25 bg-warning/10 p-3 text-sm text-warning flex items-center gap-2">
+          <AlertCircle className="h-4 w-4" />
+          <span>{gpsError}</span>
         </div>
       )}
 
@@ -353,6 +558,7 @@ export default function DriverDashboardPage() {
             driver={driver}
             myLegs={myLegs}
             openLegs={openLegs}
+            livePosition={livePosition}
             selectedLegId={selectedLegId}
             onSelectLeg={setSelectedLegId}
           />
@@ -378,7 +584,15 @@ export default function DriverDashboardPage() {
             {myLegs.map((leg) => {
               const workflow = workflowByLeg[leg.id]
               const action = nextLegAction(leg, workflow)
+              const driveState = legDriveState(leg, workflow)
+              const pauseAction = driveState === "PAUSED" ? "RESUME" : driveState === "DRIVING" ? "PAUSE" : null
+              const isSelected = selectedLegId === leg.id
+              const handoffBlocked =
+                action === "HANDOFF" &&
+                isSelected &&
+                (distanceToDropMiles === null || distanceToDropMiles > HANDOFF_COMPLETION_RADIUS_MILES)
               const isBusy = action ? actionKey === `${action}-${leg.id}` : false
+              const isPauseBusy = pauseAction ? actionKey === `${pauseAction}-${leg.id}` : false
               const handoff = workflow?.handoffs[0]
 
               return (
@@ -386,7 +600,7 @@ export default function DriverDashboardPage() {
                   key={leg.id}
                   className={cn(
                     "rounded-xl border p-4 transition-colors",
-                    selectedLegId === leg.id ? "border-primary bg-primary/5" : "border-border bg-secondary/30"
+                    isSelected ? "border-primary bg-primary/5" : "border-border bg-secondary/30"
                   )}
                 >
                   <div className="flex flex-wrap items-center justify-between gap-2 mb-2">
@@ -437,21 +651,51 @@ export default function DriverDashboardPage() {
                     </div>
                   )}
 
+                  {action === "HANDOFF" && isSelected && distanceToDropMiles !== null && (
+                    <div className="mt-2 rounded-lg border border-border bg-secondary/50 px-3 py-2 text-xs text-muted-foreground">
+                      Distance to drop zone:{" "}
+                      <span className="font-semibold text-foreground">{distanceToDropMiles.toFixed(2)} mi</span> (must be within{" "}
+                      {HANDOFF_COMPLETION_RADIUS_MILES.toFixed(2)} mi)
+                    </div>
+                  )}
+
                   <div className="mt-3 flex flex-wrap gap-2">
                     <Button variant="outline" size="sm" onClick={() => setSelectedLegId(leg.id)}>
                       <MapPin className="h-4 w-4" />
                       View Map
                     </Button>
 
+                    <Button asChild variant="outline" size="sm">
+                      <Link href={`/driver/route/${leg.id}`}>Get Directions</Link>
+                    </Button>
+
                     {action && (
                       <Button
                         size="sm"
                         onClick={() => void handleLegAction(leg)}
-                        disabled={isBusy}
+                        disabled={isBusy || handoffBlocked}
                         variant={confirmHandoffLegId === leg.id ? "destructive" : "default"}
                       >
                         {isBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlayCircle className="h-4 w-4" />}
-                        {confirmHandoffLegId === leg.id ? "Confirm Handoff" : actionLabel(action)}
+                        {action === "HANDOFF" && handoffBlocked
+                          ? distanceToDropMiles === null
+                            ? "Calculating Drop Distance..."
+                            : `Move Within ${HANDOFF_COMPLETION_RADIUS_MILES.toFixed(2)} mi`
+                          : confirmHandoffLegId === leg.id
+                          ? "Confirm Handoff"
+                          : actionLabel(action)}
+                      </Button>
+                    )}
+
+                    {pauseAction && (
+                      <Button
+                        size="sm"
+                        variant="secondary"
+                        onClick={() => void handlePauseToggle(leg)}
+                        disabled={isPauseBusy}
+                      >
+                        {isPauseBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlayCircle className="h-4 w-4" />}
+                        {pauseAction === "PAUSE" ? "Pause Drive" : "Resume Drive"}
                       </Button>
                     )}
                   </div>
@@ -468,71 +712,23 @@ export default function DriverDashboardPage() {
             <div>
               <h2 className="text-base font-semibold text-foreground">Directions to Next Location</h2>
               <p className="text-xs text-muted-foreground">
-                Leg {selectedLeg.sequence} · {selectedLeg.origin} {">"} {selectedLeg.destination}
+                Leg {selectedLeg.sequence} · Current location to pickup/transfer, then pickup to drop
               </p>
             </div>
-            {directions && (
-              <a
-                className="text-xs text-primary font-semibold"
-                href={`https://www.google.com/maps/dir/?api=1&origin=${directions.from.lat},${directions.from.lng}&destination=${directions.to.lat},${directions.to.lng}`}
-                target="_blank"
-                rel="noreferrer"
-              >
-                Open in Maps
-              </a>
+            {driver && (
+              <Link className="text-xs text-primary font-semibold" href={`/driver/route/${selectedLeg.id}`}>
+                Get Directions
+              </Link>
             )}
           </div>
 
-          {loadingDirections ? (
-            <div className="rounded-xl border border-border bg-secondary/40 p-3 text-sm text-muted-foreground inline-flex items-center gap-2">
-              <Loader2 className="h-4 w-4 animate-spin" />
-              Loading route geometry and turn-by-turn directions...
-            </div>
-          ) : directions ? (
-            <>
-              <div className="rounded-xl border border-border bg-secondary/20 p-4">
-                <DirectionsMap points={directions.directions.geometry} />
-              </div>
-
-              <div className="grid gap-2 text-xs text-muted-foreground sm:grid-cols-2">
-                <p>
-                  <span className="font-semibold text-foreground">From:</span> {directions.from.label} ({fmtLatLng(directions.from.lat, directions.from.lng)})
-                </p>
-                <p>
-                  <span className="font-semibold text-foreground">To:</span> {directions.to.label} ({fmtLatLng(directions.to.lat, directions.to.lng)})
-                </p>
-                <p>
-                  <span className="font-semibold text-foreground">Distance:</span> {directions.directions.distanceMiles.toFixed(1)} mi
-                </p>
-                <p>
-                  <span className="font-semibold text-foreground">ETA:</span> {directions.directions.durationMinutes.toFixed(0)} min
-                </p>
-              </div>
-
-              <div className="rounded-xl border border-border overflow-hidden">
-                <div className="bg-secondary/40 px-4 py-2 text-xs font-semibold uppercase tracking-wider text-muted-foreground">
-                  Turn-by-Turn
-                </div>
-                <ol className="divide-y divide-border">
-                  {directions.directions.steps.slice(0, 8).map((step, index) => (
-                    <li key={`${step.instruction}-${index}`} className="px-4 py-3 text-sm text-foreground flex items-start gap-3">
-                      <span className="mt-0.5 inline-flex h-5 w-5 items-center justify-center rounded-full bg-primary/10 text-[10px] font-semibold text-primary">
-                        {index + 1}
-                      </span>
-                      <div>
-                        <p>{step.instruction}</p>
-                        <p className="text-xs text-muted-foreground mt-1">
-                          {step.distanceMiles.toFixed(1)} mi · {step.durationMinutes.toFixed(0)} min
-                        </p>
-                      </div>
-                    </li>
-                  ))}
-                </ol>
-              </div>
-            </>
-          ) : (
-            <p className="text-sm text-muted-foreground">No map/directions available for this leg yet.</p>
-          )}
+          {driver ? (
+            <LegRouteDirections
+              driver={driver}
+              leg={selectedLeg}
+              onDistanceMilesChange={setDistanceToDropMiles}
+            />
+          ) : null}
         </section>
       )}
 
@@ -579,86 +775,6 @@ export default function DriverDashboardPage() {
           </div>
         )}
       </section>
-    </div>
-  )
-}
-
-function DirectionsMap({ points }: { points: Array<{ lat: number; lng: number }> }) {
-  const path = useMemo(() => {
-    if (points.length < 2) return null
-
-    const lats = points.map((point) => point.lat)
-    const lngs = points.map((point) => point.lng)
-    const minLat = Math.min(...lats)
-    const maxLat = Math.max(...lats)
-    const minLng = Math.min(...lngs)
-    const maxLng = Math.max(...lngs)
-
-    const width = 100
-    const height = 60
-    const pad = 6
-
-    const latRange = Math.max(maxLat - minLat, 0.0001)
-    const lngRange = Math.max(maxLng - minLng, 0.0001)
-
-    const normalized = points.map((point) => {
-      const x = pad + ((point.lng - minLng) / lngRange) * (width - pad * 2)
-      const y = height - (pad + ((point.lat - minLat) / latRange) * (height - pad * 2))
-      return { x, y }
-    })
-
-    const d = normalized.map((point, index) => `${index === 0 ? "M" : "L"}${point.x.toFixed(2)},${point.y.toFixed(2)}`).join(" ")
-
-    return {
-      d,
-      start: normalized[0],
-      end: normalized[normalized.length - 1],
-    }
-  }, [points])
-
-  if (!path) {
-    return (
-      <div className="h-56 rounded-lg bg-secondary/50 flex items-center justify-center text-sm text-muted-foreground">
-        Route geometry unavailable.
-      </div>
-    )
-  }
-
-  return (
-    <div className="relative">
-      <svg viewBox="0 0 100 60" className="w-full h-auto" style={{ minHeight: "220px" }}>
-        <rect x="0" y="0" width="100" height="60" fill="oklch(0.98 0.01 85)" />
-        {Array.from({ length: 7 }, (_, index) => (
-          <line
-            key={`grid-h-${index}`}
-            x1="0"
-            x2="100"
-            y1={(60 / 6) * index}
-            y2={(60 / 6) * index}
-            stroke="oklch(0.88 0.01 75 / 0.45)"
-            strokeWidth="0.2"
-          />
-        ))}
-        {Array.from({ length: 11 }, (_, index) => (
-          <line
-            key={`grid-v-${index}`}
-            y1="0"
-            y2="60"
-            x1={(100 / 10) * index}
-            x2={(100 / 10) * index}
-            stroke="oklch(0.88 0.01 75 / 0.45)"
-            strokeWidth="0.2"
-          />
-        ))}
-
-        <path d={path.d} fill="none" stroke="oklch(0.57 0.19 258)" strokeWidth="1.2" strokeLinecap="round" strokeLinejoin="round" />
-        <circle cx={path.start.x} cy={path.start.y} r="1.7" fill="oklch(0.63 0.15 145)" />
-        <circle cx={path.end.x} cy={path.end.y} r="1.9" fill="oklch(0.65 0.22 35)" />
-      </svg>
-      <div className="absolute right-3 top-3 rounded-lg bg-card/90 border border-border px-2 py-1 text-[10px] text-muted-foreground inline-flex items-center gap-1">
-        <Navigation className="h-3 w-3" />
-        Live route preview
-      </div>
     </div>
   )
 }

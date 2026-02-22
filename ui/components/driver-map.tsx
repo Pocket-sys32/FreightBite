@@ -1,38 +1,39 @@
 "use client"
 
-import { useCallback, useMemo, useRef, useState } from "react"
-import Map, { Layer, Marker, Popup, Source } from "react-map-gl"
-import type { MapRef } from "react-map-gl"
-import "mapbox-gl/dist/mapbox-gl.css"
+import { useEffect, useMemo, useRef, useState } from "react"
+import { GoogleMap, InfoWindowF, MarkerF, PolylineF, useJsApiLoader } from "@react-google-maps/api"
 import type { Driver, Leg, LegStatus } from "@/lib/mock-data"
 
-const MAPBOX_TOKEN = process.env.NEXT_PUBLIC_MAPBOX_TOKEN
+const GOOGLE_MAPS_API_KEY = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY || ""
 
-const FALLBACK_COORDS: Record<string, { lat: number; lng: number }> = {
-  "chicago, il": { lat: 41.8781, lng: -87.6298 },
-  "melrose park, il": { lat: 41.9006, lng: -87.8567 },
-  "iowa city, ia": { lat: 41.6611, lng: -91.5302 },
-  "coralville, ia": { lat: 41.6766, lng: -91.5918 },
-  "north platte, ne": { lat: 41.1239, lng: -100.7654 },
-  "st. george, ut": { lat: 37.0965, lng: -113.5684 },
-  "barstow, ca": { lat: 34.8958, lng: -117.0173 },
-  "rialto, ca": { lat: 34.1064, lng: -117.3703 },
-  "los angeles, ca": { lat: 34.0522, lng: -118.2437 },
-  "omaha, ne": { lat: 41.2565, lng: -95.9345 },
-  "denver, co": { lat: 39.7392, lng: -104.9903 },
+interface DriverMapProps {
+  driver: Driver
+  myLegs: Leg[]
+  openLegs: Leg[]
+  livePosition?: { lat: number; lng: number } | null
+  selectedLegId?: string | null
+  onSelectLeg?: (legId: string) => void
+}
+
+interface RoutedLeg {
+  leg: Leg
+  isMine: boolean
+  path: Array<{ lat: number; lng: number }>
+  marker: { lat: number; lng: number }
 }
 
 function statusColor(status: LegStatus): string {
   switch (status) {
     case "IN_TRANSIT":
-    case "COMPLETED":
-      return "oklch(0.65 0.2 150)"
+      return "#1D9A6C"
     case "ASSIGNED":
-      return "oklch(0.65 0.14 45)"
+      return "#CC8400"
     case "SEARCHING":
-      return "oklch(0.75 0.15 70)"
+      return "#B79A00"
+    case "COMPLETED":
+      return "#2C7A58"
     default:
-      return "oklch(0.55 0.01 260)"
+      return "#6B7280"
   }
 }
 
@@ -40,230 +41,254 @@ function statusLabel(status: LegStatus): string {
   switch (status) {
     case "IN_TRANSIT":
       return "In Transit"
-    case "COMPLETED":
-      return "Completed"
     case "ASSIGNED":
       return "Assigned"
     case "SEARCHING":
       return "Searching"
+    case "COMPLETED":
+      return "Completed"
     default:
       return "Open"
   }
 }
 
-function resolveCoord(args: {
-  city: string
-  state: string
-  address: string
-  lat?: number
-  lng?: number
-}): { lat: number; lng: number } | null {
-  if (typeof args.lat === "number" && typeof args.lng === "number") {
-    return { lat: args.lat, lng: args.lng }
+function legOriginAddress(leg: Leg): string | { lat: number; lng: number } {
+  const value = leg.originAddress?.trim()
+  if (value) return value
+  if (typeof leg.originLat === "number" && typeof leg.originLng === "number") {
+    return { lat: leg.originLat, lng: leg.originLng }
   }
-
-  const cityKey = `${args.city}, ${args.state}`.toLowerCase()
-  if (FALLBACK_COORDS[cityKey]) return FALLBACK_COORDS[cityKey]
-
-  const rawCityKey = args.city.toLowerCase()
-  if (FALLBACK_COORDS[rawCityKey]) return FALLBACK_COORDS[rawCityKey]
-
-  const addressLower = args.address.toLowerCase()
-  for (const [key, coord] of Object.entries(FALLBACK_COORDS)) {
-    if (addressLower.includes(key)) return coord
-  }
-
-  return null
+  return `${leg.origin}, ${leg.originState}`
 }
 
-interface DriverMapProps {
-  driver: Driver
-  myLegs: Leg[]
-  openLegs: Leg[]
-  selectedLegId?: string | null
-  onSelectLeg?: (legId: string) => void
+function legDestinationAddress(leg: Leg): string | { lat: number; lng: number } {
+  const value = leg.destinationAddress?.trim()
+  if (value) return value
+  if (typeof leg.destinationLat === "number" && typeof leg.destinationLng === "number") {
+    return { lat: leg.destinationLat, lng: leg.destinationLng }
+  }
+  return `${leg.destination}, ${leg.destinationState}`
 }
 
-export function DriverMap({ driver, myLegs, openLegs, selectedLegId, onSelectLeg }: DriverMapProps) {
-  const mapRef = useRef<MapRef>(null)
+export function DriverMap({ driver, myLegs, openLegs, livePosition, selectedLegId, onSelectLeg }: DriverMapProps) {
+  const mapRef = useRef<any>(null)
   const [selectedLeg, setSelectedLeg] = useState<Leg | null>(null)
   const [popupCoord, setPopupCoord] = useState<{ lat: number; lng: number } | null>(null)
-
-  const mappedLegs = useMemo(() => {
-    const myLegIds = new Set(myLegs.map((leg) => leg.id))
-    const allLegs = [...myLegs, ...openLegs.filter((leg) => !myLegIds.has(leg.id))]
-
-    return allLegs
-      .map((leg) => {
-        const origin = resolveCoord({
-          city: leg.origin,
-          state: leg.originState,
-          address: leg.originAddress,
-          lat: leg.originLat,
-          lng: leg.originLng,
-        })
-        const destination = resolveCoord({
-          city: leg.destination,
-          state: leg.destinationState,
-          address: leg.destinationAddress,
-          lat: leg.destinationLat,
-          lng: leg.destinationLng,
-        })
-
-        if (!origin || !destination) return null
-
-        return {
-          leg,
-          origin,
-          destination,
-          isMine: myLegIds.has(leg.id),
-        }
-      })
-      .filter((entry): entry is { leg: Leg; origin: { lat: number; lng: number }; destination: { lat: number; lng: number }; isMine: boolean } => Boolean(entry))
-  }, [myLegs, openLegs])
-
-  const routeGeoJSON = useMemo(
-    () => ({
-      type: "FeatureCollection",
-      features: mappedLegs.map((item) => ({
-        type: "Feature",
-        properties: {
-          legId: item.leg.id,
-          color: statusColor(item.leg.status),
-          mine: item.isMine,
-          selected: selectedLegId === item.leg.id,
-        },
-        geometry: {
-          type: "LineString",
-          coordinates: [
-            [item.origin.lng, item.origin.lat],
-            [item.destination.lng, item.destination.lat],
-          ],
-        },
-      })),
-    }),
-    [mappedLegs, selectedLegId]
+  const [routedLegs, setRoutedLegs] = useState<RoutedLeg[]>([])
+  const [routeError, setRouteError] = useState<string | null>(null)
+  const markerPosition = useMemo(
+    () => livePosition || { lat: driver.currentLat, lng: driver.currentLng },
+    [driver.currentLat, driver.currentLng, livePosition]
   )
 
-  const onMapLoad = useCallback(() => {
-    if (!mapRef.current) return
-
-    const allCoords = [
-      { lat: driver.currentLat, lng: driver.currentLng },
-      ...mappedLegs.flatMap((item) => [item.origin, item.destination]),
+  const mergedLegs = useMemo(() => {
+    const activeMyLegs = myLegs.filter((leg) => leg.status !== "COMPLETED")
+    const mine = new Set(activeMyLegs.map((leg) => leg.id))
+    const dedupedOpen = openLegs.filter((leg) => !mine.has(leg.id) && leg.status !== "COMPLETED")
+    return [
+      ...activeMyLegs.map((leg) => ({ leg, isMine: true })),
+      ...dedupedOpen.map((leg) => ({ leg, isMine: false })),
     ]
+  }, [myLegs, openLegs])
 
-    if (allCoords.length < 2) return
+  const { isLoaded, loadError } = useJsApiLoader({
+    id: "google-maps-script",
+    googleMapsApiKey: GOOGLE_MAPS_API_KEY,
+  })
 
-    const lngs = allCoords.map((coord) => coord.lng)
-    const lats = allCoords.map((coord) => coord.lat)
+  useEffect(() => {
+    let cancelled = false
 
-    mapRef.current.fitBounds(
-      [
-        [Math.min(...lngs) - 0.5, Math.min(...lats) - 0.5],
-        [Math.max(...lngs) + 0.5, Math.max(...lats) + 0.5],
-      ],
-      { padding: 50, duration: 900 }
-    )
-  }, [driver.currentLat, driver.currentLng, mappedLegs])
+    const loadRoutes = async () => {
+      if (!isLoaded) return
 
-  if (!MAPBOX_TOKEN) {
+      const googleObj = (window as Window & { google?: any }).google
+      if (!googleObj?.maps) return
+
+      if (mergedLegs.length === 0) {
+        setRoutedLegs([])
+        setRouteError(null)
+        return
+      }
+
+      try {
+        const service = new googleObj.maps.DirectionsService()
+        const routes: RoutedLeg[] = []
+
+        for (const item of mergedLegs) {
+          try {
+            const response = await service.route({
+              origin: legOriginAddress(item.leg),
+              destination: legDestinationAddress(item.leg),
+              travelMode: googleObj.maps.TravelMode.DRIVING,
+            })
+            const route = response?.routes?.[0]
+            const overviewPath = (route?.overview_path || []).map((point: any) => ({
+              lat: point.lat(),
+              lng: point.lng(),
+            }))
+            if (overviewPath.length === 0) continue
+
+            const marker = overviewPath[Math.floor(overviewPath.length / 2)]
+            routes.push({
+              leg: item.leg,
+              isMine: item.isMine,
+              path: overviewPath,
+              marker,
+            })
+          } catch {
+            continue
+          }
+        }
+
+        if (cancelled) return
+        setRoutedLegs(routes)
+        setRouteError(null)
+      } catch (error) {
+        if (cancelled) return
+        setRouteError(error instanceof Error ? error.message : "Failed to build map routes")
+        setRoutedLegs([])
+      }
+    }
+
+    void loadRoutes()
+
+    return () => {
+      cancelled = true
+    }
+  }, [isLoaded, mergedLegs])
+
+  useEffect(() => {
+    if (!isLoaded || !mapRef.current) return
+    const googleObj = (window as Window & { google?: any }).google
+    if (!googleObj?.maps) return
+
+    const bounds = new googleObj.maps.LatLngBounds()
+    bounds.extend(markerPosition)
+
+    const visibleRoutes =
+      selectedLegId && routedLegs.some((item) => item.leg.id === selectedLegId)
+        ? routedLegs.filter((item) => item.leg.id === selectedLegId)
+        : routedLegs.filter((item) => item.isMine)
+
+    const routesToFit = visibleRoutes.length > 0 ? visibleRoutes : routedLegs
+
+    if (!selectedLegId && livePosition) {
+      mapRef.current.panTo(markerPosition)
+      mapRef.current.setZoom(13)
+      return
+    }
+
+    for (const item of routesToFit) {
+      for (const point of item.path) {
+        bounds.extend(point)
+      }
+    }
+    mapRef.current.fitBounds(bounds, 70)
+  }, [isLoaded, livePosition, markerPosition, routedLegs, selectedLegId])
+
+  if (!GOOGLE_MAPS_API_KEY) {
     return (
       <div className="h-[340px] rounded-xl border border-border bg-secondary/40 flex items-center justify-center p-4 text-sm text-muted-foreground text-center">
-        Add `NEXT_PUBLIC_MAPBOX_TOKEN` to enable the driver map.
+        Add `NEXT_PUBLIC_GOOGLE_MAPS_API_KEY` to enable the driver map.
+      </div>
+    )
+  }
+
+  if (loadError) {
+    return (
+      <div className="h-[340px] rounded-xl border border-border bg-secondary/40 flex items-center justify-center p-4 text-sm text-destructive text-center">
+        Failed to load Google Maps.
+      </div>
+    )
+  }
+
+  if (!isLoaded) {
+    return (
+      <div className="h-[340px] rounded-xl border border-border bg-secondary/40 flex items-center justify-center p-4 text-sm text-muted-foreground text-center">
+        Loading Google Maps...
+      </div>
+    )
+  }
+
+  if (routeError) {
+    return (
+      <div className="h-[340px] rounded-xl border border-border bg-secondary/40 flex items-center justify-center p-4 text-sm text-muted-foreground text-center">
+        Unable to build live leg routes from addresses.
+      </div>
+    )
+  }
+
+  if (routedLegs.length === 0) {
+    return (
+      <div className="h-[340px] rounded-xl border border-border bg-secondary/40 flex items-center justify-center p-4 text-sm text-muted-foreground text-center">
+        No active routes to display.
       </div>
     )
   }
 
   return (
     <div className="relative w-full overflow-hidden rounded-xl border border-border" style={{ height: "340px" }}>
-      <Map
-        ref={mapRef}
-        mapboxAccessToken={MAPBOX_TOKEN}
-        initialViewState={{ longitude: driver.currentLng || -98.5, latitude: driver.currentLat || 39.5, zoom: 4.8 }}
-        style={{ width: "100%", height: "100%" }}
-        mapStyle="mapbox://styles/mapbox/dark-v11"
-        onLoad={onMapLoad}
-        attributionControl
-        interactive
+      <GoogleMap
+        mapContainerStyle={{ width: "100%", height: "100%" }}
+        onLoad={(map) => {
+          mapRef.current = map
+        }}
+        center={markerPosition}
+        zoom={11}
+        options={{
+          mapTypeControl: false,
+          streetViewControl: false,
+          fullscreenControl: false,
+        }}
       >
-        <Source id="driver-relay-routes" type="geojson" data={routeGeoJSON as never}>
-          <Layer
-            id="driver-route-glow"
-            type="line"
-            paint={{
-              "line-color": ["get", "color"],
-              "line-width": ["case", ["get", "selected"], 8, 6],
-              "line-opacity": 0.12,
-              "line-blur": 5,
-            }}
-          />
-          <Layer
-            id="driver-route-line"
-            type="line"
-            paint={{
-              "line-color": ["get", "color"],
-              "line-width": ["case", ["get", "selected"], 4, ["case", ["get", "mine"], 3, 2]],
-              "line-opacity": ["case", ["get", "mine"], 0.9, 0.45],
-              "line-dasharray": ["case", ["get", "mine"], ["literal", [1, 0]], ["literal", [4, 3]]],
-            }}
-          />
-        </Source>
-
-        <Marker longitude={driver.currentLng} latitude={driver.currentLat} anchor="center">
-          <div className="relative">
-            <div className="absolute left-1/2 top-1/2 h-5 w-5 -translate-x-1/2 -translate-y-1/2 rounded-full bg-sky-400/30 animate-ping" />
-            <div className="relative h-3.5 w-3.5 rounded-full border border-white bg-sky-400" />
-          </div>
-        </Marker>
-
-        {mappedLegs.map((item) => {
-          const mid = {
-            lat: (item.origin.lat + item.destination.lat) / 2,
-            lng: (item.origin.lng + item.destination.lng) / 2,
-          }
-          const isSelected = selectedLegId === item.leg.id
-
+        {routedLegs.map((item) => {
+          const selected = selectedLegId === item.leg.id
           return (
-            <Marker
-              key={`driver-leg-${item.leg.id}`}
-              longitude={mid.lng}
-              latitude={mid.lat}
-              anchor="center"
-              onClick={(event) => {
-                event.originalEvent.stopPropagation()
-                setSelectedLeg(item.leg)
-                setPopupCoord(mid)
-                onSelectLeg?.(item.leg.id)
+            <PolylineF
+              key={`line-${item.leg.id}`}
+              path={item.path}
+              options={{
+                strokeColor: statusColor(item.leg.status),
+                strokeOpacity: item.isMine ? 0.95 : 0.42,
+                strokeWeight: selected ? 6 : item.isMine ? 4 : 2,
               }}
-            >
-              <div
-                className="inline-flex h-5 w-5 items-center justify-center rounded-full border text-[10px] font-semibold"
-                style={{
-                  backgroundColor: isSelected ? "oklch(0.65 0.14 45)" : "oklch(0.2 0.01 260 / 0.9)",
-                  borderColor: statusColor(item.leg.status),
-                  color: isSelected ? "oklch(0.13 0.005 260)" : "oklch(0.93 0.005 80)",
-                }}
-              >
-                {item.leg.sequence}
-              </div>
-            </Marker>
+            />
           )
         })}
 
+        <MarkerF
+          position={markerPosition}
+          label={{ text: "You", color: "#0F172A", fontWeight: "700", fontSize: "10px" }}
+        />
+
+        {routedLegs.map((item) => (
+          <MarkerF
+            key={`marker-${item.leg.id}`}
+            position={item.marker}
+            label={{
+              text: String(item.leg.sequence),
+              color: "#0F172A",
+              fontWeight: "700",
+              fontSize: "11px",
+            }}
+            onClick={() => {
+              setSelectedLeg(item.leg)
+              setPopupCoord(item.marker)
+              onSelectLeg?.(item.leg.id)
+            }}
+          />
+        ))}
+
         {selectedLeg && popupCoord && (
-          <Popup
-            longitude={popupCoord.lng}
-            latitude={popupCoord.lat}
-            anchor="bottom"
-            closeButton
-            closeOnClick={false}
-            onClose={() => {
+          <InfoWindowF
+            position={popupCoord}
+            onCloseClick={() => {
               setSelectedLeg(null)
               setPopupCoord(null)
             }}
           >
-            <div className="p-2 min-w-[220px]">
+            <div className="min-w-[220px] p-1">
               <div className="flex items-center gap-2 mb-1.5">
                 <span className="inline-flex h-6 w-6 items-center justify-center rounded-full bg-secondary text-xs font-semibold text-foreground">
                   {selectedLeg.sequence}
@@ -281,13 +306,13 @@ export function DriverMap({ driver, myLegs, openLegs, selectedLegId, onSelectLeg
               <p className="text-[10px] text-muted-foreground mt-1">{selectedLeg.originAddress}</p>
               <p className="text-[10px] text-muted-foreground">{selectedLeg.destinationAddress}</p>
             </div>
-          </Popup>
+          </InfoWindowF>
         )}
-      </Map>
+      </GoogleMap>
 
-      <div className="absolute left-3 top-3 inline-flex items-center gap-2 rounded-md border border-border bg-card/90 px-2.5 py-1.5 text-[10px] font-semibold text-muted-foreground">
+      <div className="absolute left-3 top-3 inline-flex items-center gap-2 rounded-md border border-border bg-card/95 px-2.5 py-1.5 text-[10px] font-semibold text-muted-foreground">
         <span className="inline-flex items-center gap-1">
-          <span className="h-2 w-2 rounded-full bg-sky-400" /> Driver
+          <span className="h-2 w-2 rounded-full bg-sky-500" /> You
         </span>
         <span className="inline-flex items-center gap-1">
           <span className="h-2 w-2 rounded-full bg-primary" /> My legs

@@ -41,8 +41,8 @@ function statusClass(status: string) {
 }
 
 export default function ShipperPortalPage() {
-  const [origin, setOrigin] = useState("Melrose Park, IL")
-  const [destination, setDestination] = useState("Rialto, CA")
+  const [origin, setOrigin] = useState("2700 S California Ave, Chicago, IL 60608")
+  const [destination, setDestination] = useState("8155 Beech Ave, Fontana, CA 92335")
   const [load, setLoad] = useState<Load | null>(null)
   const [loading, setLoading] = useState(false)
   const [bootstrapping, setBootstrapping] = useState(true)
@@ -124,10 +124,10 @@ export default function ShipperPortalPage() {
         <div className="flex flex-col gap-4 sm:flex-row sm:items-end">
           <div className="flex-1">
             <label className="mb-2 block text-[10px] font-semibold text-muted-foreground uppercase tracking-[0.15em]">
-              Origin
+              Origin Address
             </label>
             <Input
-              placeholder="Melrose Park, IL"
+              placeholder="2700 S California Ave, Chicago, IL 60608"
               value={origin}
               onChange={(event) => setOrigin(event.target.value)}
               className="h-11 rounded-xl border-border bg-secondary/40 focus:border-primary"
@@ -138,10 +138,10 @@ export default function ShipperPortalPage() {
           </div>
           <div className="flex-1">
             <label className="mb-2 block text-[10px] font-semibold text-muted-foreground uppercase tracking-[0.15em]">
-              Destination
+              Destination Address
             </label>
             <Input
-              placeholder="Rialto, CA"
+              placeholder="8155 Beech Ave, Fontana, CA 92335"
               value={destination}
               onChange={(event) => setDestination(event.target.value)}
               className="h-11 rounded-xl border-border bg-secondary/40 focus:border-primary"

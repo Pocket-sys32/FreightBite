@@ -9,6 +9,8 @@ const STATUS_VALUES = new Set(['OPEN', 'IN_TRANSIT', 'COMPLETE']);
 const LEG_EVENT_TYPES = new Set([
   'ASSIGNED',
   'START_ROUTE',
+  'PAUSE_ROUTE',
+  'RESUME_ROUTE',
   'ARRIVED',
   'HANDOFF_READY',
   'HANDOFF_NOTIFIED',
@@ -882,6 +884,34 @@ async function getDriverByEmail(email) {
   return db.get('SELECT * FROM drivers WHERE lower(email) = lower(?)', [email]);
 }
 
+async function updateDriverLocation(driverId, { current_lat, current_lng }) {
+  const lat = typeof current_lat === 'number' ? current_lat : null;
+  const lng = typeof current_lng === 'number' ? current_lng : null;
+
+  if (useSupabase) {
+    const { data, error } = await supabase
+      .from('drivers')
+      .update({ current_lat: lat, current_lng: lng })
+      .eq('id', driverId)
+      .select('*')
+      .maybeSingle();
+
+    if (error) {
+      throw error;
+    }
+
+    return data;
+  }
+
+  const db = await getSqliteDb();
+  await db.run(
+    'UPDATE drivers SET current_lat = ?, current_lng = ? WHERE id = ?',
+    [lat, lng, driverId]
+  );
+
+  return db.get('SELECT * FROM drivers WHERE id = ?', [driverId]);
+}
+
 async function getContactById(id) {
   if (useSupabase) {
     const { data, error } = await supabase
@@ -973,6 +1003,7 @@ module.exports = {
   listDrivers,
   getDriverById,
   getDriverByEmail,
+  updateDriverLocation,
   getContactById,
   listOpenLegsNear,
   listContactsByDriver
