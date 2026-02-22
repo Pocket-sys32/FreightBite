@@ -12,6 +12,7 @@ import {
   Wifi,
 } from "lucide-react"
 import { Button } from "@/components/ui/button"
+import { DriverMap } from "@/components/driver-map"
 import { LegCard } from "@/components/leg-card"
 import { cn } from "@/lib/utils"
 import { type Driver, HOS_RULES, type Leg } from "@/lib/mock-data"
@@ -100,6 +101,7 @@ export default function DriverDashboardPage() {
   const [loading, setLoading] = useState(true)
   const [loadingDirections, setLoadingDirections] = useState(false)
   const [actionKey, setActionKey] = useState<string | null>(null)
+  const [confirmHandoffLegId, setConfirmHandoffLegId] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [notice, setNotice] = useState<string | null>(null)
 
@@ -221,6 +223,14 @@ export default function DriverDashboardPage() {
       const action = nextLegAction(leg, workflow)
       if (!action) return
 
+      if (action === "HANDOFF") {
+        if (confirmHandoffLegId !== leg.id) {
+          setConfirmHandoffLegId(leg.id)
+          return
+        }
+        setConfirmHandoffLegId(null)
+      }
+
       setActionKey(`${action}-${leg.id}`)
       setError(null)
 
@@ -246,7 +256,7 @@ export default function DriverDashboardPage() {
         setActionKey(null)
       }
     },
-    [driver, loadBoard, workflowByLeg]
+    [confirmHandoffLegId, driver, loadBoard, workflowByLeg]
   )
 
   const filteredOpenLegs = useMemo(
@@ -328,6 +338,31 @@ export default function DriverDashboardPage() {
         </div>
       )}
 
+      <section className="rounded-2xl border border-border bg-card p-5 flex flex-col gap-3">
+        <div className="flex items-center justify-between">
+          <div>
+            <h2 className="text-base font-semibold text-foreground">Live Route Map</h2>
+            <p className="text-xs text-muted-foreground">
+              Select a leg from the map or list to drive the route workflow.
+            </p>
+          </div>
+        </div>
+
+        {driver ? (
+          <DriverMap
+            driver={driver}
+            myLegs={myLegs}
+            openLegs={openLegs}
+            selectedLegId={selectedLegId}
+            onSelectLeg={setSelectedLegId}
+          />
+        ) : (
+          <div className="h-[340px] rounded-xl border border-border bg-secondary/40 flex items-center justify-center p-4 text-sm text-muted-foreground text-center">
+            Driver session is required to render the map.
+          </div>
+        )}
+      </section>
+
       <section className="rounded-2xl border border-border bg-card p-5 flex flex-col gap-4">
         <div className="flex items-center justify-between">
           <div>
@@ -387,6 +422,21 @@ export default function DriverDashboardPage() {
                     </p>
                   </div>
 
+                  <div className="mt-2 flex flex-col gap-1 text-sm text-foreground">
+                    <p>
+                      <span className="font-medium">Pickup:</span> {leg.originAddress}
+                    </p>
+                    <p>
+                      <span className="font-medium">Drop-off:</span> {leg.destinationAddress}
+                    </p>
+                  </div>
+
+                  {confirmHandoffLegId === leg.id && (
+                    <div className="mt-2 rounded-lg border border-warning/40 bg-warning/10 px-3 py-2 text-xs text-warning">
+                      Complete handoff for this leg? The next driver will be notified. Tap again to confirm.
+                    </div>
+                  )}
+
                   <div className="mt-3 flex flex-wrap gap-2">
                     <Button variant="outline" size="sm" onClick={() => setSelectedLegId(leg.id)}>
                       <MapPin className="h-4 w-4" />
@@ -394,9 +444,14 @@ export default function DriverDashboardPage() {
                     </Button>
 
                     {action && (
-                      <Button size="sm" onClick={() => void handleLegAction(leg)} disabled={isBusy}>
+                      <Button
+                        size="sm"
+                        onClick={() => void handleLegAction(leg)}
+                        disabled={isBusy}
+                        variant={confirmHandoffLegId === leg.id ? "destructive" : "default"}
+                      >
                         {isBusy ? <Loader2 className="h-4 w-4 animate-spin" /> : <PlayCircle className="h-4 w-4" />}
-                        {actionLabel(action)}
+                        {confirmHandoffLegId === leg.id ? "Confirm Handoff" : actionLabel(action)}
                       </Button>
                     )}
                   </div>

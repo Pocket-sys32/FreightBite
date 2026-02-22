@@ -53,6 +53,8 @@ interface RawLeg {
   rate_cents?: number
   status?: string
   driver_id?: string | null
+  origin_address?: string | null
+  destination_address?: string | null
 }
 
 interface RawDriver {
@@ -331,6 +333,8 @@ function mapLeg(raw: RawLeg, driverNameById: Map<string, string>): Leg {
   const ratePerMile = miles > 0 ? Number((rateCents / miles / 100).toFixed(2)) : 0
   const origin = pointLabel(raw.origin, "Origin")
   const destination = pointLabel(raw.destination, "Destination")
+  const originCoords = pointCoords(raw.origin)
+  const destinationCoords = pointCoords(raw.destination)
   const handoffPoint = pointLabel(raw.handoff_point, "Handoff Point")
   const handoffCoords = pointCoords(raw.handoff_point)
   const handoffAddress =
@@ -348,8 +352,14 @@ function mapLeg(raw: RawLeg, driverNameById: Map<string, string>): Leg {
     sequence,
     origin,
     originState: stateFromLabel(origin),
+    originAddress: raw.origin_address || pointLabel(raw.origin, "Origin"),
+    originLat: typeof originCoords.lat === "number" ? originCoords.lat : undefined,
+    originLng: typeof originCoords.lng === "number" ? originCoords.lng : undefined,
     destination,
     destinationState: stateFromLabel(destination),
+    destinationAddress: raw.destination_address || pointLabel(raw.destination, "Destination"),
+    destinationLat: typeof destinationCoords.lat === "number" ? destinationCoords.lat : undefined,
+    destinationLng: typeof destinationCoords.lng === "number" ? destinationCoords.lng : undefined,
     miles,
     deadheadMiles: 0,
     handoffPoint,

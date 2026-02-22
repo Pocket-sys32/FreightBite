@@ -17,9 +17,10 @@ import {
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { RelayMap } from "@/components/relay-map"
 import { RouteVisualizer } from "@/components/route-visualizer"
 import { fetchLatestLoad, submitLoadByLabel } from "@/lib/backend-api"
-import type { Leg, Load } from "@/lib/mock-data"
+import type { Load } from "@/lib/mock-data"
 
 function statusLabel(status: string) {
   const normalized = status.toUpperCase()
@@ -248,7 +249,7 @@ export default function ShipperPortalPage() {
                 </div>
 
                 <div className="mb-6 rounded-xl overflow-hidden border border-border bg-secondary/30 p-4">
-                  <RouteMap legs={load.legs} />
+                  <RelayMap legs={load.legs} />
                 </div>
 
                 <div className="overflow-x-auto">
@@ -338,90 +339,6 @@ export default function ShipperPortalPage() {
           No loads yet. Submit one above to generate relay legs from the backend.
         </div>
       )}
-    </div>
-  )
-}
-
-function RouteMap({ legs }: { legs: Leg[] }) {
-  const labels = [
-    legs[0]?.origin || "Origin",
-    ...legs.map((leg) => leg.destination),
-  ]
-
-  const cities = labels.map((name, index) => ({
-    name: name.split(",")[0].trim(),
-    x: 90 - (index * 80) / Math.max(labels.length - 1, 1),
-    y: 18 + (index % 2) * 12 + index * 2,
-  }))
-
-  return (
-    <div className="relative">
-      <svg viewBox="0 0 100 80" className="w-full h-auto" style={{ minHeight: "200px" }}>
-        {Array.from({ length: 6 }, (_, index) => (
-          <line
-            key={`h${index}`}
-            x1="0"
-            y1={index * 16}
-            x2="100"
-            y2={index * 16}
-            stroke="oklch(0.88 0.01 75 / 0.6)"
-            strokeWidth="0.15"
-          />
-        ))}
-        {Array.from({ length: 8 }, (_, index) => (
-          <line
-            key={`v${index}`}
-            x1={index * 14}
-            y1="0"
-            x2={index * 14}
-            y2="80"
-            stroke="oklch(0.88 0.01 75 / 0.6)"
-            strokeWidth="0.15"
-          />
-        ))}
-
-        {cities.slice(0, -1).map((city, index) => {
-          const next = cities[index + 1]
-          const status = legs[index]?.status || "OPEN"
-          const stroke =
-            status === "IN_TRANSIT"
-              ? "oklch(0.6 0.14 155)"
-              : status === "COMPLETED"
-              ? "oklch(0.62 0.12 145)"
-              : "oklch(0.52 0.12 40)"
-
-          return (
-            <line
-              key={`${city.name}-${next.name}`}
-              x1={city.x}
-              y1={city.y}
-              x2={next.x}
-              y2={next.y}
-              stroke={stroke}
-              strokeWidth="0.75"
-              strokeLinecap="round"
-              opacity="0.75"
-            />
-          )
-        })}
-
-        {cities.map((city, index) => (
-          <g key={`${city.name}-${index}`}>
-            <circle cx={city.x} cy={city.y} r={2} fill="oklch(0.52 0.12 40)" opacity="0.9" />
-            <text
-              x={city.x}
-              y={city.y + 6}
-              textAnchor="middle"
-              fontSize="2.8"
-              fontWeight="600"
-              fill="oklch(0.5 0.02 60)"
-              fontFamily="system-ui"
-            >
-              {city.name}
-            </text>
-          </g>
-        ))}
-      </svg>
     </div>
   )
 }

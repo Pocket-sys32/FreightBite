@@ -69,6 +69,8 @@ export function LegCard({
             <p className="text-base font-bold text-foreground truncate">
               {leg.origin} <span className="text-muted-foreground font-normal mx-1">{">"}</span> {leg.destination}
             </p>
+            <p className="text-xs text-muted-foreground truncate">{leg.originAddress}</p>
+            <p className="text-xs text-muted-foreground truncate">{leg.destinationAddress}</p>
             <div className="flex items-center gap-2 mt-0.5">
               <span className="text-xs text-muted-foreground font-mono">{leg.loadId}</span>
               {isReefer && (

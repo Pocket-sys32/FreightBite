@@ -243,6 +243,22 @@ function emitLegUpdate(leg) {
 io.on('connection', (socket) => {
   console.log('Client connected:', socket.id);
 
+  // Driver joins their personal room upon auth
+  socket.on('auth:join', (data) => {
+    const { token } = data || {};
+    if (!token) return;
+    try {
+      const payload = jwt.verify(token, JWT_SECRET);
+      if (payload?.sub) {
+        socket.join(`driver:${payload.sub}`);
+        socket.driverId = payload.sub;
+        console.log(`Driver ${payload.sub} joined room driver:${payload.sub}`);
+      }
+    } catch (e) {
+      console.error('Socket auth failed:', e.message);
+    }
+  });
+
   socket.on('disconnect', () => {
     console.log('Client disconnected:', socket.id);
   });
@@ -336,12 +352,26 @@ app.get('/api/legs', async (req, res) => {
       return res.status(400).json({ error: 'Invalid status filter' });
     }
 
-    const legs = await db.listLegs({
-      status,
-      loadId: req.query.loadId || req.query.load_id,
-      driverId: req.query.driverId || req.query.driver_id,
-      limit: req.query.limit
-    });
+    const authDriver = await getAuthenticatedDriver(req);
+    let legs;
+
+    if (authDriver) {
+      // Authenticated driver: only see OPEN legs + their own
+      legs = await db.listLegsForDriver(authDriver.id, {
+        status,
+        loadId: req.query.loadId || req.query.load_id,
+        limit: req.query.limit
+      });
+    } else {
+      // Unauthenticated (shipper/admin): see all legs
+      legs = await db.listLegs({
+        status,
+        loadId: req.query.loadId || req.query.load_id,
+        driverId: req.query.driverId || req.query.driver_id,
+        limit: req.query.limit
+      });
+    }
+
     return res.json((legs || []).map(hydrateLeg));
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to list legs' });
@@ -546,7 +576,9 @@ app.post('/api/loads/submit', async (req, res) => {
         handoff_point: JSON.stringify(leg.handoff_point),
         rate_cents: 0,
         status: leg.status,
-        driver_id: null
+        driver_id: null,
+        origin_address: leg.origin_address || null,
+        destination_address: leg.destination_address || null
       }))
     );
 
@@ -623,11 +655,11 @@ app.get('/api/legs/:id/directions', async (req, res) => {
 /** POST /api/legs/:id/accept — claim leg (handshake begins) */
 app.post('/api/legs/:id/accept', async (req, res) => {
   const legId = req.params.id;
-  const driverId = await resolveDriverId(req);
-
-  if (!driverId) {
-    return res.status(400).json({ error: 'Body must include driverId or use auth token' });
+  const authDriver = await getAuthenticatedDriver(req);
+  if (!authDriver) {
+    return res.status(401).json({ error: 'Authentication required' });
   }
+  const driverId = authDriver.id;
 
   try {
     const leg = await db.getLegById(legId);
@@ -672,10 +704,11 @@ app.post('/api/legs/:id/accept', async (req, res) => {
 /** POST /api/legs/:id/start-route — driver starts navigation */
 app.post('/api/legs/:id/start-route', async (req, res) => {
   const legId = req.params.id;
-  const driverId = await resolveDriverId(req);
-  if (!driverId) {
-    return res.status(400).json({ error: 'Body must include driverId or use auth token' });
+  const authDriver = await getAuthenticatedDriver(req);
+  if (!authDriver) {
+    return res.status(401).json({ error: 'Authentication required' });
   }
+  const driverId = authDriver.id;
 
   try {
     const leg = await db.getLegById(legId);
@@ -706,10 +739,11 @@ app.post('/api/legs/:id/start-route', async (req, res) => {
 /** POST /api/legs/:id/arrive — driver arrived at destination/handoff */
 app.post('/api/legs/:id/arrive', async (req, res) => {
   const legId = req.params.id;
-  const driverId = await resolveDriverId(req);
-  if (!driverId) {
-    return res.status(400).json({ error: 'Body must include driverId or use auth token' });
+  const authDriver = await getAuthenticatedDriver(req);
+  if (!authDriver) {
+    return res.status(401).json({ error: 'Authentication required' });
   }
+  const driverId = authDriver.id;
 
   try {
     const leg = await db.getLegById(legId);
@@ -743,6 +777,12 @@ app.post('/api/legs/:id/arrive', async (req, res) => {
         payload: { fromLegId: leg.id, fromDriverId: driverId }
       });
       emitLegUpdate(nextLeg);
+      io.to(`driver:${nextLeg.driver_id}`).emit('leg:handoff-ready', {
+        legId: nextLeg.id,
+        loadId: nextLeg.load_id,
+        fromLegId: leg.id,
+        message: 'Driver has arrived at handoff point. Prepare for handoff.'
+      });
     }
 
     emitLegUpdate(leg);
@@ -755,10 +795,11 @@ app.post('/api/legs/:id/arrive', async (req, res) => {
 
 async function finishHandoff(req, res) {
   const legId = req.params.id;
-  const driverId = await resolveDriverId(req);
-  if (!driverId) {
-    return res.status(400).json({ error: 'Body must include driverId or use auth token' });
+  const authDriver = await getAuthenticatedDriver(req);
+  if (!authDriver) {
+    return res.status(401).json({ error: 'Authentication required' });
   }
+  const driverId = authDriver.id;
 
   try {
     const leg = await db.getLegById(legId);
@@ -787,6 +828,18 @@ async function finishHandoff(req, res) {
         status: 'COMPLETE'
       });
 
+      await db.createLegEvent({
+        leg_id: nextLeg.id,
+        load_id: nextLeg.load_id,
+        driver_id: nextLeg.driver_id,
+        event_type: 'HANDOFF_NOTIFIED',
+        payload: JSON.stringify({
+          completedLegId: completedLeg.id,
+          completedByDriverId: driverId,
+          notifiedAt: new Date().toISOString()
+        })
+      });
+
       if (nextLeg.status === 'IN_TRANSIT') {
         await db.createLegEvent({
           leg_id: nextLeg.id,
@@ -797,6 +850,13 @@ async function finishHandoff(req, res) {
         });
         autoStartedNextLeg = nextLeg;
       }
+
+      io.to(`driver:${nextLeg.driver_id}`).emit('leg:handoff-ready', {
+        legId: nextLeg.id,
+        loadId: nextLeg.load_id,
+        fromLegId: completedLeg.id,
+        message: 'Previous leg completed. Your leg is ready to start.'
+      });
     }
 
     emitLegUpdate(completedLeg);
@@ -824,9 +884,8 @@ legEvents.on('leg.update', (payload) => {
 
 async function ensureDemoData() {
   try {
-    const existingDriver = await db.getDriverById('drv_demo_1');
+    const existingDriver = await db.getDriverByEmail('alex.rivera@example.com');
     const demoDriver = existingDriver || await db.createDriver({
-      id: 'drv_demo_1',
       name: 'Alex Rivera',
       email: 'alex.rivera@example.com',
       current_lat: 41.8781,
@@ -849,7 +908,6 @@ async function ensureDemoData() {
     const existingContacts = await db.listContactsByDriver(demoDriver.id);
     if (!existingContacts || existingContacts.length === 0) {
       await db.createContact({
-        id: 'contact_demo_1',
         driver_id: demoDriver.id,
         broker_name: 'Midwest Freight Co',
         broker_email: 'dispatch@midwestfreight.example',
