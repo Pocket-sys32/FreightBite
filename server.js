@@ -3,13 +3,19 @@ require('dotenv').config();
 
 const express = require('express');
 const http = require('http');
+const fs = require('fs');
+const fsp = require('fs/promises');
+const os = require('os');
+const path = require('path');
+const { spawn } = require('child_process');
 const { EventEmitter } = require('events');
 const { Server } = require('socket.io');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const db = require('./server/db');
 const { segmentLoad } = require('./server/segmentLoad');
-const { metersToMiles } = require('./server/geo');
+const { haversineMiles, metersToMiles } = require('./server/geo');
+const { supabase, supabaseAdmin } = require('./lib/supabase');
 
 // Route modules
 const documentsRouter = require('./routes/documents');
@@ -22,7 +28,7 @@ const { draftBrokerEmail } = require('./lib/ai/email-drafter');
 const { getRecommendation } = require('./lib/ai/whats-next');
 
 const app = express();
-app.use(express.json());
+app.use(express.json({ limit: '25mb' }));
 app.use((req, res, next) => {
   res.header('Access-Control-Allow-Origin', '*');
   res.header('Access-Control-Allow-Methods', 'GET,POST,PATCH,DELETE,OPTIONS');
@@ -67,6 +73,303 @@ async function getAuthenticatedDriver(req) {
   }
 }
 
+const MAX_OUTREACH_UPLOAD_BYTES = 20 * 1024 * 1024;
+const OUTREACH_DOC_TYPES = new Set(['invoice', 'bol', 'rate_sheet', 'contract', 'other']);
+
+function isMissingColumnError(error, columnName) {
+  const message = String(error?.message || error?.details || '').toLowerCase();
+  return message.includes(columnName.toLowerCase()) && message.includes('column');
+}
+
+function tryParseJsonFromStdout(stdout) {
+  const text = String(stdout || '').trim();
+  if (!text) return null;
+  try {
+    return JSON.parse(text);
+  } catch (_) {
+    const line = text
+      .split(/\r?\n/)
+      .map((item) => item.trim())
+      .reverse()
+      .find((item) => item.startsWith('{') && item.endsWith('}'));
+    if (!line) return null;
+    try {
+      return JSON.parse(line);
+    } catch {
+      return null;
+    }
+  }
+}
+
+function safeUploadFilename(filename) {
+  const base = path.basename(String(filename || 'upload.pdf')).replace(/[^\w.\-]+/g, '_');
+  return base.toLowerCase().endsWith('.pdf') ? base : `${base}.pdf`;
+}
+
+function runExtractor(pythonBin, args, env) {
+  return new Promise((resolve, reject) => {
+    const child = spawn(pythonBin, args, { env });
+    let stdout = '';
+    let stderr = '';
+
+    child.stdout.on('data', (chunk) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on('data', (chunk) => {
+      stderr += chunk.toString();
+    });
+    child.on('error', reject);
+    child.on('close', (code) => {
+      resolve({ code: code ?? 1, stdout, stderr });
+    });
+  });
+}
+
+async function runExtractorWithFallback(args, env) {
+  const venvPython = path.join(process.cwd(), 'scripts', 'pdf_extract', 'venv', 'bin', 'python');
+  const candidates = fs.existsSync(venvPython) ? [venvPython, 'python3', 'python'] : ['python3', 'python'];
+  let lastError = null;
+
+  for (const pythonBin of candidates) {
+    try {
+      const result = await runExtractor(pythonBin, args, env);
+      if (result.code === 0) {
+        return { ...result, pythonBin };
+      }
+      lastError = new Error(result.stderr || result.stdout || `Extractor exited with code ${result.code}`);
+    } catch (error) {
+      if (error?.code === 'ENOENT') {
+        continue;
+      }
+      lastError = error;
+    }
+  }
+
+  throw lastError || new Error('Unable to execute Python extractor');
+}
+
+async function upsertCompanyForDriver(sb, driverId, extracted) {
+  const brokerName = String(extracted?.broker_name || '').trim();
+  if (!brokerName) return null;
+
+  let ownerColumnSupported = true;
+  let query = sb
+    .from('companies')
+    .select('id')
+    .eq('name', brokerName)
+    .eq('company_type', 'broker')
+    .eq('owner_driver_id', driverId)
+    .limit(1)
+    .maybeSingle();
+
+  let lookup = await query;
+  if (lookup.error && isMissingColumnError(lookup.error, 'owner_driver_id')) {
+    ownerColumnSupported = false;
+    lookup = await sb
+      .from('companies')
+      .select('id')
+      .eq('name', brokerName)
+      .eq('company_type', 'broker')
+      .limit(1)
+      .maybeSingle();
+  }
+  if (lookup.error) {
+    throw lookup.error;
+  }
+  if (lookup.data?.id) {
+    return { id: lookup.data.id, ownerColumnSupported };
+  }
+
+  const metadata = { source: 'outreach_upload', driver_uuid: driverId };
+  const payload = {
+    name: brokerName,
+    company_type: 'broker',
+    email: extracted?.broker_email || null,
+    metadata,
+  };
+  if (ownerColumnSupported) {
+    payload.owner_driver_id = driverId;
+  }
+
+  let inserted = await sb.from('companies').insert(payload).select('id').single();
+  if (inserted.error && ownerColumnSupported && isMissingColumnError(inserted.error, 'owner_driver_id')) {
+    ownerColumnSupported = false;
+    delete payload.owner_driver_id;
+    inserted = await sb.from('companies').insert(payload).select('id').single();
+  }
+  if (inserted.error) {
+    throw inserted.error;
+  }
+
+  return { id: inserted.data.id, ownerColumnSupported };
+}
+
+async function createContractForDriver(sb, driverId, companyId, documentId, documentType, extracted, ownerColumnSupported) {
+  const contractType = documentType === 'contract'
+    ? 'master_agreement'
+    : documentType === 'rate_sheet'
+      ? 'rate_confirmation'
+      : 'other';
+  const effectiveDate = extracted?.invoice_date || extracted?.pickup_date || null;
+  const contractPayload = {
+    company_id: companyId,
+    document_id: documentId || null,
+    contract_type: contractType,
+    status: 'active',
+    effective_date: effectiveDate,
+    metadata: {
+      source: 'outreach_upload',
+      driver_uuid: driverId,
+      extracted,
+    },
+  };
+  if (ownerColumnSupported) {
+    contractPayload.owner_driver_id = driverId;
+  }
+
+  let inserted = await sb.from('contracts').insert(contractPayload).select('id').single();
+  if (inserted.error && ownerColumnSupported && isMissingColumnError(inserted.error, 'owner_driver_id')) {
+    delete contractPayload.owner_driver_id;
+    inserted = await sb.from('contracts').insert(contractPayload).select('id').single();
+  }
+  if (inserted.error) {
+    throw inserted.error;
+  }
+
+  return inserted.data.id;
+}
+
+async function createContractContactForDriver(sb, driverId, companyId, contractId, extracted, ownerColumnSupported) {
+  const name = String(extracted?.broker_name || '').trim() || 'Broker Contact';
+  const payload = {
+    company_id: companyId,
+    contract_id: contractId,
+    name,
+    role: 'broker',
+    email: extracted?.broker_email || null,
+    is_primary: true,
+    notes: `Uploaded via outreach parser for driver ${driverId}`,
+  };
+  if (ownerColumnSupported) {
+    payload.owner_driver_id = driverId;
+  }
+
+  let inserted = await sb.from('contract_contacts').insert(payload).select('id').single();
+  if (inserted.error && ownerColumnSupported && isMissingColumnError(inserted.error, 'owner_driver_id')) {
+    delete payload.owner_driver_id;
+    inserted = await sb.from('contract_contacts').insert(payload).select('id').single();
+  }
+  if (inserted.error) {
+    throw inserted.error;
+  }
+  return inserted.data.id;
+}
+
+async function linkRatesToDriverContract(sb, driverId, documentId, companyId, contractId, ownerColumnSupported) {
+  if (!documentId || !companyId || !contractId) return 0;
+  const rateUpdates = { contract_id: contractId };
+  if (ownerColumnSupported) {
+    rateUpdates.owner_driver_id = driverId;
+  }
+
+  let updateResult = await sb
+    .from('rates')
+    .update(rateUpdates)
+    .eq('document_id', documentId)
+    .eq('company_id', companyId)
+    .select('id');
+
+  if (updateResult.error && ownerColumnSupported && isMissingColumnError(updateResult.error, 'owner_driver_id')) {
+    delete rateUpdates.owner_driver_id;
+    updateResult = await sb
+      .from('rates')
+      .update(rateUpdates)
+      .eq('document_id', documentId)
+      .eq('company_id', companyId)
+      .select('id');
+  }
+  if (updateResult.error) {
+    throw updateResult.error;
+  }
+  return Array.isArray(updateResult.data) ? updateResult.data.length : 0;
+}
+
+async function linkExtractionToDriverData({ driverId, extracted, documentId, documentType }) {
+  const summary = {
+    localContactCreated: false,
+    companyId: null,
+    contractId: null,
+    contractContactId: null,
+    ratesLinked: 0,
+  };
+
+  const brokerName = String(extracted?.broker_name || '').trim();
+  if (brokerName) {
+    const currentContacts = await db.listContactsByDriver(driverId);
+    const brokerEmail = String(extracted?.broker_email || '').trim() || null;
+    const hasExisting = (currentContacts || []).some((contact) => {
+      const sameName = String(contact.broker_name || '').trim().toLowerCase() === brokerName.toLowerCase();
+      const sameEmail = brokerEmail
+        ? String(contact.broker_email || '').trim().toLowerCase() === brokerEmail.toLowerCase()
+        : false;
+      return sameName || sameEmail;
+    });
+
+    if (!hasExisting) {
+      await db.createContact({
+        driver_id: driverId,
+        broker_name: brokerName,
+        broker_email: brokerEmail,
+        last_worked_together: new Date().toISOString().slice(0, 10),
+      });
+      summary.localContactCreated = true;
+    }
+  }
+
+  const sb = supabaseAdmin || supabase;
+  if (!sb || !brokerName) {
+    return summary;
+  }
+
+  const company = await upsertCompanyForDriver(sb, driverId, extracted);
+  if (!company?.id) {
+    return summary;
+  }
+  summary.companyId = company.id;
+
+  const contractId = await createContractForDriver(
+    sb,
+    driverId,
+    company.id,
+    documentId,
+    documentType,
+    extracted,
+    company.ownerColumnSupported
+  );
+  summary.contractId = contractId;
+
+  const contractContactId = await createContractContactForDriver(
+    sb,
+    driverId,
+    company.id,
+    contractId,
+    extracted,
+    company.ownerColumnSupported
+  );
+  summary.contractContactId = contractContactId;
+
+  summary.ratesLinked = await linkRatesToDriverContract(
+    sb,
+    driverId,
+    documentId,
+    company.id,
+    contractId,
+    company.ownerColumnSupported
+  );
+
+  return summary;
+}
+
 // AI dispatcher endpoints
 app.post('/api/auth/register-driver', async (req, res) => {
   const {
@@ -100,7 +403,7 @@ app.post('/api/auth/register-driver', async (req, res) => {
       email,
       current_lat: typeof currentLat === 'number' ? currentLat : null,
       current_lng: typeof currentLng === 'number' ? currentLng : null,
-      hos_remaining_hours: typeof hosRemainingHours === 'number' ? hosRemainingHours : 8,
+      hos_remaining_hours: typeof hosRemainingHours === 'number' ? hosRemainingHours : 11,
       home_lat: typeof homeLat === 'number' ? homeLat : null,
       home_lng: typeof homeLng === 'number' ? homeLng : null
     });
@@ -169,7 +472,7 @@ app.post('/api/auth/oauth-session', async (req, res) => {
         email,
         current_lat: typeof currentLat === 'number' ? currentLat : null,
         current_lng: typeof currentLng === 'number' ? currentLng : null,
-        hos_remaining_hours: 8,
+        hos_remaining_hours: 11,
         home_lat: typeof homeLat === 'number' ? homeLat : null,
         home_lng: typeof homeLng === 'number' ? homeLng : null
       });
@@ -215,6 +518,115 @@ app.post('/api/ai/whats-next', async (req, res) => {
   }
 });
 
+app.post('/api/outreach/extract-upload', async (req, res) => {
+  const authDriver = await getAuthenticatedDriver(req);
+  if (!authDriver) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+
+  const {
+    filename,
+    contentBase64,
+    documentType = 'contract',
+    useLlm = false,
+  } = req.body || {};
+
+  if (!filename || !contentBase64) {
+    return res.status(400).json({ error: 'filename and contentBase64 are required' });
+  }
+  if (!OUTREACH_DOC_TYPES.has(documentType)) {
+    return res.status(400).json({ error: `Invalid documentType. Allowed: ${Array.from(OUTREACH_DOC_TYPES).join(', ')}` });
+  }
+
+  let fileBuffer;
+  try {
+    const cleanedBase64 = String(contentBase64)
+      .replace(/^data:application\/pdf;base64,/i, '')
+      .replace(/\s+/g, '');
+    fileBuffer = Buffer.from(cleanedBase64, 'base64');
+  } catch {
+    return res.status(400).json({ error: 'Invalid base64 payload' });
+  }
+
+  if (!fileBuffer || fileBuffer.length === 0) {
+    return res.status(400).json({ error: 'Uploaded file is empty' });
+  }
+  if (fileBuffer.length > MAX_OUTREACH_UPLOAD_BYTES) {
+    return res.status(413).json({ error: `File is too large. Max ${Math.round(MAX_OUTREACH_UPLOAD_BYTES / (1024 * 1024))}MB` });
+  }
+  if (fileBuffer.subarray(0, 4).toString() !== '%PDF') {
+    return res.status(400).json({ error: 'Only PDF uploads are supported' });
+  }
+
+  const tempDir = path.join(os.tmpdir(), 'freightbite-outreach-uploads');
+  const tempFilePath = path.join(
+    tempDir,
+    `${Date.now()}-${Math.random().toString(36).slice(2, 10)}-${safeUploadFilename(filename)}`
+  );
+
+  try {
+    await fsp.mkdir(tempDir, { recursive: true });
+    await fsp.writeFile(tempFilePath, fileBuffer);
+
+    const scriptPath = path.join(process.cwd(), 'scripts', 'pdf_extract', 'extract_invoice.py');
+    const args = [
+      scriptPath,
+      tempFilePath,
+      '--user-id',
+      authDriver.id,
+      '--document-type',
+      documentType,
+      '--json-output',
+    ];
+    if (useLlm) {
+      args.push('--use-llm');
+    }
+
+    const extraction = await runExtractorWithFallback(args, {
+      ...process.env,
+      SUPABASE_URL: process.env.SUPABASE_URL || process.env.NEXT_PUBLIC_SUPABASE_URL,
+      SUPABASE_ANON_KEY: process.env.SUPABASE_ANON_KEY || process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY,
+    });
+
+    const parsed = tryParseJsonFromStdout(extraction.stdout);
+    const firstResult = parsed?.results?.[0];
+    if (!firstResult) {
+      return res.status(500).json({
+        error: 'Extractor returned no structured result',
+        details: extraction.stderr || extraction.stdout || null,
+      });
+    }
+    if (firstResult.error) {
+      return res.status(422).json({ error: firstResult.error });
+    }
+
+    const linkage = await linkExtractionToDriverData({
+      driverId: authDriver.id,
+      extracted: firstResult.extracted || {},
+      documentId: firstResult.document_id || null,
+      documentType,
+    });
+
+    return res.status(201).json({
+      filename: firstResult.filename || filename,
+      documentId: firstResult.document_id || null,
+      extracted: firstResult.extracted || null,
+      linked: linkage,
+    });
+  } catch (error) {
+    return res.status(500).json({
+      error: 'Failed to process upload',
+      details: error?.message || String(error),
+    });
+  } finally {
+    try {
+      await fsp.unlink(tempFilePath);
+    } catch (_) {
+      // best-effort temp file cleanup
+    }
+  }
+});
+
 const server = http.createServer(app);
 const io = new Server(server, {
   cors: { origin: '*' }
@@ -223,6 +635,10 @@ const io = new Server(server, {
 const PORT = process.env.PORT || 3000;
 const legEvents = new EventEmitter();
 const JWT_SECRET = process.env.JWT_SECRET || 'freightbite-dev-secret-change-me';
+const ENABLE_DEMO_SEED = process.env.ENABLE_DEMO_SEED === 'true';
+const HANDOFF_COMPLETION_RADIUS_MILES = Number.isFinite(Number(process.env.HANDOFF_COMPLETION_RADIUS_MILES))
+  ? Number(process.env.HANDOFF_COMPLETION_RADIUS_MILES)
+  : 0.25;
 
 function emitLegUpdate(leg) {
   const payload = {
@@ -413,6 +829,49 @@ app.get('/api/drivers/:id/contacts', async (req, res) => {
     return res.json(contacts || []);
   } catch (error) {
     return res.status(500).json({ error: error.message || 'Failed to list contacts' });
+  }
+});
+
+/** PATCH /api/drivers/me/location — live GPS update for authenticated driver */
+app.patch('/api/drivers/me/location', async (req, res) => {
+  const authDriver = await getAuthenticatedDriver(req);
+  if (!authDriver) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+
+  const { lat, lng, accuracy } = req.body || {};
+  if (typeof lat !== 'number' || typeof lng !== 'number') {
+    return res.status(400).json({ error: 'lat and lng are required' });
+  }
+
+  if (!Number.isFinite(lat) || !Number.isFinite(lng) || lat < -90 || lat > 90 || lng < -180 || lng > 180) {
+    return res.status(400).json({ error: 'Invalid GPS coordinates' });
+  }
+
+  try {
+    const driver = await db.updateDriverLocation(authDriver.id, {
+      current_lat: lat,
+      current_lng: lng
+    });
+
+    if (!driver) {
+      return res.status(404).json({ error: 'Driver not found' });
+    }
+
+    const payload = {
+      driverId: driver.id,
+      lat,
+      lng,
+      accuracy: typeof accuracy === 'number' && Number.isFinite(accuracy) ? accuracy : null,
+      updatedAt: new Date().toISOString()
+    };
+
+    io.emit('driver:location', payload);
+    io.to(`driver:${driver.id}`).emit('driver:location', payload);
+
+    return res.json({ driver });
+  } catch (error) {
+    return res.status(500).json({ error: error.message || 'Failed to update driver location' });
   }
 });
 
@@ -736,6 +1195,83 @@ app.post('/api/legs/:id/start-route', async (req, res) => {
   }
 });
 
+/** POST /api/legs/:id/pause-route — driver pauses active driving (e.g., food break) */
+app.post('/api/legs/:id/pause-route', async (req, res) => {
+  const legId = req.params.id;
+  const authDriver = await getAuthenticatedDriver(req);
+  if (!authDriver) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  const driverId = authDriver.id;
+
+  try {
+    const leg = await db.getLegById(legId);
+    if (!leg) return res.status(404).json({ error: 'Leg not found' });
+    if (leg.driver_id !== driverId) return res.status(403).json({ error: 'Driver does not own this leg' });
+    if (leg.status !== 'IN_TRANSIT') return res.status(409).json({ error: 'Leg is not active' });
+
+    const latest = await db.getLatestLegEvent(leg.id);
+    const latestType = latest?.event_type || '';
+    if (latestType === 'PAUSE_ROUTE') {
+      return res.status(409).json({ error: 'Route is already paused' });
+    }
+    if (!['START_ROUTE', 'AUTO_START_ROUTE', 'RESUME_ROUTE'].includes(latestType)) {
+      return res.status(409).json({ error: 'Cannot pause until route has started' });
+    }
+
+    await db.createLegEvent({
+      leg_id: leg.id,
+      load_id: leg.load_id,
+      driver_id: driverId,
+      event_type: 'PAUSE_ROUTE',
+      payload: { pausedAt: new Date().toISOString(), reason: req.body?.reason || 'break' }
+    });
+
+    emitLegUpdate(leg);
+    const workflow = await buildLegWorkflow(leg);
+    return res.json({ leg: hydrateLeg(leg), workflow });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to pause route', details: error.message });
+  }
+});
+
+/** POST /api/legs/:id/resume-route — driver resumes an already paused route */
+app.post('/api/legs/:id/resume-route', async (req, res) => {
+  const legId = req.params.id;
+  const authDriver = await getAuthenticatedDriver(req);
+  if (!authDriver) {
+    return res.status(401).json({ error: 'Authentication required' });
+  }
+  const driverId = authDriver.id;
+
+  try {
+    const leg = await db.getLegById(legId);
+    if (!leg) return res.status(404).json({ error: 'Leg not found' });
+    if (leg.driver_id !== driverId) return res.status(403).json({ error: 'Driver does not own this leg' });
+    if (leg.status !== 'IN_TRANSIT') return res.status(409).json({ error: 'Leg is not active' });
+
+    const latest = await db.getLatestLegEvent(leg.id);
+    const latestType = latest?.event_type || '';
+    if (latestType !== 'PAUSE_ROUTE') {
+      return res.status(409).json({ error: 'Route is not paused' });
+    }
+
+    await db.createLegEvent({
+      leg_id: leg.id,
+      load_id: leg.load_id,
+      driver_id: driverId,
+      event_type: 'RESUME_ROUTE',
+      payload: { resumedAt: new Date().toISOString() }
+    });
+
+    emitLegUpdate(leg);
+    const workflow = await buildLegWorkflow(leg);
+    return res.json({ leg: hydrateLeg(leg), workflow });
+  } catch (error) {
+    return res.status(500).json({ error: 'Failed to resume route', details: error.message });
+  }
+});
+
 /** POST /api/legs/:id/arrive — driver arrived at destination/handoff */
 app.post('/api/legs/:id/arrive', async (req, res) => {
   const legId = req.params.id;
@@ -800,12 +1336,61 @@ async function finishHandoff(req, res) {
     return res.status(401).json({ error: 'Authentication required' });
   }
   const driverId = authDriver.id;
+  let currentDriver = authDriver;
 
   try {
     const leg = await db.getLegById(legId);
     if (!leg) return res.status(404).json({ error: 'Leg not found' });
     if (leg.driver_id !== driverId) return res.status(403).json({ error: 'Driver does not own this leg' });
     if (leg.status !== 'IN_TRANSIT') return res.status(409).json({ error: 'Leg is not active' });
+
+    const latInput = req.body?.currentLat ?? req.body?.lat;
+    const lngInput = req.body?.currentLng ?? req.body?.lng;
+    if (typeof latInput === 'number' && typeof lngInput === 'number') {
+      if (!Number.isFinite(latInput) || !Number.isFinite(lngInput) || latInput < -90 || latInput > 90 || lngInput < -180 || lngInput > 180) {
+        return res.status(400).json({ error: 'Invalid GPS coordinates provided for handoff completion' });
+      }
+
+      const updatedDriver = await db.updateDriverLocation(driverId, { current_lat: latInput, current_lng: lngInput });
+      if (updatedDriver) {
+        currentDriver = updatedDriver;
+        const payload = {
+          driverId,
+          lat: latInput,
+          lng: lngInput,
+          accuracy: typeof req.body?.accuracy === 'number' ? req.body.accuracy : null,
+          updatedAt: new Date().toISOString()
+        };
+        io.emit('driver:location', payload);
+        io.to(`driver:${driverId}`).emit('driver:location', payload);
+      }
+    }
+
+    const destinationPoint = toCoordinatePoint(leg.destination, 'Leg destination');
+    if (!destinationPoint) {
+      return res.status(400).json({ error: 'Leg destination coordinates are missing' });
+    }
+    if (typeof currentDriver.current_lat !== 'number' || typeof currentDriver.current_lng !== 'number') {
+      return res.status(409).json({
+        error: 'Live GPS required before finishing handoff',
+        details: 'Enable location sharing and wait for GPS fix.'
+      });
+    }
+
+    const milesAway = haversineMiles(
+      { lat: currentDriver.current_lat, lng: currentDriver.current_lng },
+      { lat: destinationPoint.lat, lng: destinationPoint.lng }
+    );
+    if (milesAway > HANDOFF_COMPLETION_RADIUS_MILES) {
+      return res.status(409).json({
+        error: 'Too far from drop zone to finish handoff',
+        details: `Driver is ${milesAway.toFixed(2)} miles away. Move within ${HANDOFF_COMPLETION_RADIUS_MILES.toFixed(2)} miles.`,
+        proximity: {
+          milesAway: Number(milesAway.toFixed(3)),
+          requiredMiles: Number(HANDOFF_COMPLETION_RADIUS_MILES.toFixed(3))
+        }
+      });
+    }
 
     const completedLeg = await db.updateLegStatus(legId, 'COMPLETE');
     await db.createLegEvent({
@@ -890,7 +1475,7 @@ async function ensureDemoData() {
       email: 'alex.rivera@example.com',
       current_lat: 41.8781,
       current_lng: -87.6298,
-      hos_remaining_hours: 8.5,
+      hos_remaining_hours: 11,
       home_lat: 39.7392,
       home_lng: -104.9903
     });
@@ -925,5 +1510,9 @@ server.listen(PORT, () => {
   console.log(`Server listening on http://localhost:${PORT}`);
   console.log('Socket.io ready for mobile clients');
   console.log(`Trigger push: POST http://localhost:${PORT}/push-order or run: npm run push-order`);
-  void ensureDemoData();
+  if (ENABLE_DEMO_SEED) {
+    void ensureDemoData();
+  } else {
+    console.log('Demo seed disabled. Set ENABLE_DEMO_SEED=true to enable local sample records.');
+  }
 });

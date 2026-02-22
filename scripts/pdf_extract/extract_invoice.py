@@ -16,6 +16,7 @@ Env: SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY (or SUPABASE_ANON_KEY),
 """
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -734,6 +735,7 @@ def main():
     ap.add_argument("--user-id", dest="user_id", default=os.environ.get("SUPABASE_USER_ID"), help="Supabase Auth user ID (links document to account)")
     ap.add_argument("--use-llm", action="store_true", default=os.environ.get("EXTRACT_USE_LLM") == "1", help="Use OpenAI to parse OCR text (set OPENAI_API_KEY)")
     ap.add_argument("--document-type", default="invoice", choices=["invoice", "bol", "rate_sheet", "contract", "other"], help="document_type for Supabase")
+    ap.add_argument("--json-output", action="store_true", help="Print machine-readable JSON payload")
     args = ap.parse_args()
 
     sb = get_supabase()
@@ -746,15 +748,26 @@ def main():
         print("Path not found:", path, file=sys.stderr)
         sys.exit(1)
 
+    results = []
     for f in files:
-        print("Processing:", f.name)
         out = process_pdf(str(f), args.user_id, sb, use_llm=args.use_llm, document_type=args.document_type)
-        if out["error"]:
-            print("  Error:", out["error"])
-        else:
-            print("  Document ID:", out["document_id"])
-            print("  Extracted:", out["extracted"])
-    print("Done.")
+        results.append({
+            "filename": f.name,
+            "document_id": out.get("document_id"),
+            "extracted": out.get("extracted"),
+            "error": out.get("error"),
+        })
+        if not args.json_output:
+            print("Processing:", f.name)
+            if out["error"]:
+                print("  Error:", out["error"])
+            else:
+                print("  Document ID:", out["document_id"])
+                print("  Extracted:", out["extracted"])
+    if args.json_output:
+        print(json.dumps({"results": results}, ensure_ascii=False))
+    else:
+        print("Done.")
 
 
 if __name__ == "__main__":

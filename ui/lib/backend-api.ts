@@ -1,6 +1,7 @@
 import type { BrokerContact, Driver, Leg, LegStatus, Load, NearbyLoad } from "@/lib/mock-data"
 
 const AUTH_TOKEN_KEY = "freightbite_driver_token"
+const API_ORIGIN = process.env.NEXT_PUBLIC_API_ORIGIN?.replace(/\/+$/, "")
 
 function isBrowser() {
   return typeof window !== "undefined"
@@ -184,6 +185,7 @@ const KNOWN_LOCATIONS: Record<string, { lat: number; lng: number; label: string 
   "omaha, ne": { lat: 41.2565, lng: -95.9345, label: "Omaha, NE" },
   "denver, co": { lat: 39.7392, lng: -104.9903, label: "Denver, CO" },
 }
+const GOOGLE_MAPS_API_KEY = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY
 
 const TRAILER_TYPES: Driver["trailerType"][] = ["Dry Van", "Reefer", "Flatbed", "Step Deck"]
 const TRAILER_LENGTHS: Driver["trailerLength"][] = ["53ft", "48ft"]
@@ -275,7 +277,13 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
     headers.Authorization = `Bearer ${token}`
   }
 
-  const response = await fetch(path, {
+  const url = path.startsWith("http://") || path.startsWith("https://")
+    ? path
+    : API_ORIGIN
+    ? `${API_ORIGIN}${path.startsWith("/") ? path : `/${path}`}`
+    : path
+
+  const response = await fetch(url, {
     ...init,
     headers,
   })
@@ -298,7 +306,11 @@ function mapDriver(raw: RawDriver): Driver {
   const hash = stableHash(raw.id)
   const currentCity = nearestKnownLabel(raw.current_lat ?? null, raw.current_lng ?? null, "On Route")
   const homeCity = nearestKnownLabel(raw.home_lat ?? null, raw.home_lng ?? null, "Home Base")
-  const hosRemainingHours = Number(toNumber(raw.hos_remaining_hours, 7).toFixed(1))
+  const hosRemainingHours = Number(Math.max(0, Math.min(11, toNumber(raw.hos_remaining_hours, 11))).toFixed(1))
+  const fallbackLat =
+    typeof raw.home_lat === "number" && Number.isFinite(raw.home_lat) ? raw.home_lat : 39.5
+  const fallbackLng =
+    typeof raw.home_lng === "number" && Number.isFinite(raw.home_lng) ? raw.home_lng : -98.35
 
   return {
     id: raw.id,
@@ -306,10 +318,10 @@ function mapDriver(raw: RawDriver): Driver {
     email: raw.email,
     mcNumber: `MC-${String(hash).slice(0, 7)}`,
     dotNumber: `${1000000 + (hash % 9000000)}`,
-    currentLat: toNumber(raw.current_lat, 0),
-    currentLng: toNumber(raw.current_lng, 0),
+    currentLat: toNumber(raw.current_lat, fallbackLat),
+    currentLng: toNumber(raw.current_lng, fallbackLng),
     hosRemainingHours,
-    hosCycleUsed: Number(Math.max(0, Math.min(70, 70 - hosRemainingHours * 4.5)).toFixed(1)),
+    hosCycleUsed: 0,
     lastRestartDate: new Date(Date.now() - 2 * 24 * 60 * 60 * 1000).toISOString().slice(0, 10),
     homeLat: toNumber(raw.home_lat, 0),
     homeLng: toNumber(raw.home_lng, 0),
@@ -477,10 +489,51 @@ function mapContact(raw: RawContact): BrokerContact {
   }
 }
 
-function resolveLocation(input: string): { lat: number; lng: number; label: string } {
+async function geocodeAddress(input: string): Promise<{ lat: number; lng: number; label: string } | null> {
+  if (!GOOGLE_MAPS_API_KEY) return null
+
+  const params = new URLSearchParams({
+    address: input,
+    key: GOOGLE_MAPS_API_KEY,
+  })
+
+  try {
+    const response = await fetch(`https://maps.googleapis.com/maps/api/geocode/json?${params.toString()}`)
+    if (!response.ok) return null
+
+    const payload = (await response.json()) as {
+      status?: string
+      results?: Array<{
+        formatted_address?: string
+        geometry?: { location?: { lat?: number; lng?: number } }
+      }>
+    }
+    const first = payload.results?.[0]
+    const lat = first?.geometry?.location?.lat
+    const lng = first?.geometry?.location?.lng
+    if (payload.status !== "OK" || typeof lat !== "number" || typeof lng !== "number") return null
+
+    return {
+      lat,
+      lng,
+      label: first?.formatted_address || input,
+    }
+  } catch {
+    return null
+  }
+}
+
+async function resolveLocation(input: string): Promise<{ lat: number; lng: number; label: string }> {
+  const geocoded = await geocodeAddress(input)
+  if (geocoded) return geocoded
+
   const normalized = input.trim().toLowerCase()
   const known = KNOWN_LOCATIONS[normalized]
   if (known) return known
+
+  for (const [key, location] of Object.entries(KNOWN_LOCATIONS)) {
+    if (normalized.includes(key)) return location
+  }
 
   const latLngMatch = input.match(/^\s*(-?\d+(?:\.\d+)?)\s*,\s*(-?\d+(?:\.\d+)?)\s*$/)
   if (latLngMatch) {
@@ -491,7 +544,7 @@ function resolveLocation(input: string): { lat: number; lng: number; label: stri
     }
   }
 
-  throw new Error(`Unknown location "${input}". Use a known city (e.g. Chicago, IL) or "lat,lng".`)
+  throw new Error(`Unknown location "${input}". Use a valid address, known city, or "lat,lng".`)
 }
 
 async function fetchDriverNames(): Promise<Map<string, string>> {
@@ -559,6 +612,18 @@ export async function fetchCurrentDriver(): Promise<Driver | null> {
   }
 }
 
+export async function updateDriverLiveLocation(input: {
+  lat: number
+  lng: number
+  accuracy?: number
+}): Promise<Driver> {
+  const response = await apiFetch<{ driver: RawDriver }>("/api/drivers/me/location", {
+    method: "PATCH",
+    body: JSON.stringify(input),
+  })
+  return mapDriver(response.driver)
+}
+
 export async function fetchDriverContacts(driverId: string): Promise<BrokerContact[]> {
   const raw = await apiFetch<RawContact[]>(`/api/drivers/${driverId}/contacts`)
   return (raw || []).map(mapContact)
@@ -593,8 +658,10 @@ export async function fetchLatestLoad(): Promise<Load | null> {
 }
 
 export async function submitLoadByLabel(originInput: string, destinationInput: string): Promise<Load> {
-  const origin = resolveLocation(originInput)
-  const destination = resolveLocation(destinationInput)
+  const [origin, destination] = await Promise.all([
+    resolveLocation(originInput),
+    resolveLocation(destinationInput),
+  ])
   const response = await apiFetch<{ load: RawLoad; legs: RawLeg[] }>("/api/loads/submit", {
     method: "POST",
     body: JSON.stringify({ origin, destination }),
@@ -640,15 +707,45 @@ export async function arriveAtLegStop(legId: string, driverId: string): Promise<
   }
 }
 
+export async function pauseLegRoute(legId: string, driverId: string): Promise<{ leg: Leg; workflow: LegWorkflow }> {
+  const response = await apiFetch<{ leg: RawLeg; workflow: RawLegWorkflow }>(`/api/legs/${legId}/pause-route`, {
+    method: "POST",
+    body: JSON.stringify({ driverId }),
+  })
+  const driverNames = await fetchDriverNames()
+  return {
+    leg: mapLeg(response.leg, driverNames),
+    workflow: mapWorkflow(response.workflow, driverNames),
+  }
+}
+
+export async function resumeLegRoute(legId: string, driverId: string): Promise<{ leg: Leg; workflow: LegWorkflow }> {
+  const response = await apiFetch<{ leg: RawLeg; workflow: RawLegWorkflow }>(`/api/legs/${legId}/resume-route`, {
+    method: "POST",
+    body: JSON.stringify({ driverId }),
+  })
+  const driverNames = await fetchDriverNames()
+  return {
+    leg: mapLeg(response.leg, driverNames),
+    workflow: mapWorkflow(response.workflow, driverNames),
+  }
+}
+
 export async function finishLegHandoff(
   legId: string,
-  driverId: string
+  driverId: string,
+  location?: { currentLat?: number; currentLng?: number; accuracy?: number }
 ): Promise<{ leg: Leg; workflow: LegWorkflow; autoStartedNextLeg?: Leg | null }> {
   const response = await apiFetch<{ leg: RawLeg; workflow: RawLegWorkflow; autoStartedNextLeg?: RawLeg | null }>(
     `/api/legs/${legId}/handoff`,
     {
       method: "POST",
-      body: JSON.stringify({ driverId }),
+      body: JSON.stringify({
+        driverId,
+        currentLat: location?.currentLat,
+        currentLng: location?.currentLng,
+        accuracy: location?.accuracy,
+      }),
     }
   )
   const driverNames = await fetchDriverNames()
@@ -739,4 +836,34 @@ export async function draftOutreachEmail(args: {
     subject: response.subject || `Coverage request - ${contact.company}`,
     body: response.body || "No draft returned.",
   }
+}
+
+export interface OutreachUploadResult {
+  filename: string
+  documentId: string | null
+  extracted: Record<string, unknown> | null
+  linked: {
+    localContactCreated: boolean
+    companyId: string | null
+    contractId: string | null
+    contractContactId: string | null
+    ratesLinked: number
+  }
+}
+
+export async function uploadOutreachDocument(input: {
+  filename: string
+  contentBase64: string
+  documentType?: "invoice" | "bol" | "rate_sheet" | "contract" | "other"
+  useLlm?: boolean
+}): Promise<OutreachUploadResult> {
+  return apiFetch<OutreachUploadResult>("/api/outreach/extract-upload", {
+    method: "POST",
+    body: JSON.stringify({
+      filename: input.filename,
+      contentBase64: input.contentBase64,
+      documentType: input.documentType || "contract",
+      useLlm: Boolean(input.useLlm),
+    }),
+  })
 }

@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useMemo, useState } from "react"
+import { ChangeEvent, useCallback, useEffect, useMemo, useState } from "react"
 import {
   Send,
   CheckCircle2,
@@ -9,6 +9,7 @@ import {
   ChevronRight,
   Phone,
   AlertCircle,
+  FileUp,
 } from "lucide-react"
 import { cn } from "@/lib/utils"
 import { type BrokerContact, type Driver, type Leg } from "@/lib/mock-data"
@@ -17,11 +18,29 @@ import {
   fetchCurrentDriver,
   fetchDriverContacts,
   fetchLegs,
+  uploadOutreachDocument,
 } from "@/lib/backend-api"
 
 interface DraftEmail {
   subject: string
   body: string
+}
+
+function fileToBase64(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader()
+    reader.onerror = () => reject(new Error(`Failed to read ${file.name}`))
+    reader.onload = () => {
+      const result = typeof reader.result === "string" ? reader.result : ""
+      const payload = result.includes(",") ? result.split(",")[1] : result
+      if (!payload) {
+        reject(new Error(`Unable to encode ${file.name}`))
+        return
+      }
+      resolve(payload)
+    }
+    reader.readAsDataURL(file)
+  })
 }
 
 export default function EmailOutreachPage() {
@@ -36,38 +55,40 @@ export default function EmailOutreachPage() {
   const [sentEmails, setSentEmails] = useState<Set<string>>(new Set())
   const [sendingId, setSendingId] = useState<string | null>(null)
   const [copied, setCopied] = useState(false)
+  const [uploading, setUploading] = useState(false)
+  const [uploadNotice, setUploadNotice] = useState<string | null>(null)
+
+  const loadData = useCallback(async () => {
+    setLoading(true)
+    setError(null)
+    try {
+      const selectedDriver = await fetchCurrentDriver()
+      setDriver(selectedDriver)
+
+      if (!selectedDriver) {
+        setContacts([])
+        return
+      }
+
+      const [driverContacts, openLegs] = await Promise.all([
+        fetchDriverContacts(selectedDriver.id),
+        fetchLegs({ status: "OPEN" }),
+      ])
+
+      setContacts(driverContacts)
+      setActiveContactId(driverContacts[0]?.id || null)
+      setGapLeg(openLegs[0] || null)
+    } catch (loadError) {
+      const message = loadError instanceof Error ? loadError.message : "Failed to load outreach data"
+      setError(message)
+    } finally {
+      setLoading(false)
+    }
+  }, [])
 
   useEffect(() => {
-    const loadData = async () => {
-      setLoading(true)
-      setError(null)
-      try {
-        const selectedDriver = await fetchCurrentDriver()
-        setDriver(selectedDriver)
-
-        if (!selectedDriver) {
-          setContacts([])
-          return
-        }
-
-        const [driverContacts, openLegs] = await Promise.all([
-          fetchDriverContacts(selectedDriver.id),
-          fetchLegs({ status: "OPEN" }),
-        ])
-
-        setContacts(driverContacts)
-        setActiveContactId(driverContacts[0]?.id || null)
-        setGapLeg(openLegs[0] || null)
-      } catch (loadError) {
-        const message = loadError instanceof Error ? loadError.message : "Failed to load outreach data"
-        setError(message)
-      } finally {
-        setLoading(false)
-      }
-    }
-
     void loadData()
-  }, [])
+  }, [loadData])
 
   const activeContact = useMemo(
     () => contacts.find((contact) => contact.id === activeContactId) || null,
@@ -121,6 +142,62 @@ export default function EmailOutreachPage() {
     setTimeout(() => setCopied(false), 1800)
   }
 
+  const handleFileUpload = async (event: ChangeEvent<HTMLInputElement>) => {
+    const files = Array.from(event.target.files || [])
+    if (files.length === 0) return
+    if (!driver) {
+      setError("Sign in as a driver before uploading outreach files.")
+      event.target.value = ""
+      return
+    }
+
+    setUploading(true)
+    setError(null)
+    setUploadNotice(null)
+
+    let successCount = 0
+    const failures: string[] = []
+    let latestSuccessNotice: string | null = null
+
+    for (const file of files) {
+      if (!file.name.toLowerCase().endsWith(".pdf")) {
+        failures.push(`${file.name}: Only PDF files are supported`)
+        continue
+      }
+      try {
+        const base64 = await fileToBase64(file)
+        const result = await uploadOutreachDocument({
+          filename: file.name,
+          contentBase64: base64,
+          documentType: "contract",
+          useLlm: true,
+        })
+        successCount += 1
+        const brokerName = String(result.extracted?.broker_name || "").trim()
+        if (brokerName) {
+          latestSuccessNotice = `Processed ${file.name}. Linked broker "${brokerName}" to your outreach account.`
+        }
+      } catch (uploadError) {
+        failures.push(`${file.name}: ${uploadError instanceof Error ? uploadError.message : "Upload failed"}`)
+      }
+    }
+
+    if (successCount > 0) {
+      await loadData()
+      setUploadNotice(
+        latestSuccessNotice ||
+          `Processed ${successCount} file${successCount === 1 ? "" : "s"} and linked extracted records to your UUID (${driver.id}).`
+      )
+    }
+
+    if (failures.length > 0) {
+      setError(failures.join(" | "))
+    }
+
+    setUploading(false)
+    event.target.value = ""
+  }
+
   const isSent = activeContact ? sentEmails.has(activeContact.id) : false
   const isSending = activeContact ? sendingId === activeContact.id : false
   const totalPay = gapLeg ? Math.round((gapLeg.rateCents + gapLeg.fuelSurchargeCents) / 100) : 0
@@ -139,6 +216,48 @@ export default function EmailOutreachPage() {
               <span>{error}</span>
             </div>
           )}
+
+          {uploadNotice && (
+            <div className="rounded-xl border border-success/25 bg-success/10 p-3 text-sm text-success flex items-center gap-2">
+              <CheckCircle2 className="h-4 w-4" />
+              <span>{uploadNotice}</span>
+            </div>
+          )}
+
+          <section className="rounded-2xl border border-border bg-card p-4 flex flex-col gap-3">
+            <p className="text-xs font-bold text-muted-foreground uppercase tracking-widest">
+              Upload Contracts / Rate Sheets for Outreach
+            </p>
+            <p className="text-sm text-muted-foreground">
+              Upload PDF documents to scrape broker and lane details, then link extracted contacts/contracts to your driver UUID.
+            </p>
+            <div className="flex items-center gap-3">
+              <label className="inline-flex">
+                <input
+                  type="file"
+                  accept=".pdf,application/pdf"
+                  multiple
+                  className="sr-only"
+                  onChange={(event) => void handleFileUpload(event)}
+                  disabled={uploading || !driver}
+                />
+                <span
+                  className={cn(
+                    "rounded-2xl bg-primary text-primary-foreground font-bold text-sm px-5 py-3 min-h-[52px] inline-flex items-center justify-center gap-2",
+                    uploading || !driver ? "opacity-60 cursor-not-allowed" : "cursor-pointer active:scale-[0.98] transition-transform"
+                  )}
+                >
+                  {uploading ? <Loader2 className="h-4.5 w-4.5 animate-spin" /> : <FileUp className="h-4.5 w-4.5" />}
+                  {uploading ? "Scraping..." : "Upload PDFs to Scrape"}
+                </span>
+              </label>
+              {driver && (
+                <span className="text-xs text-muted-foreground">
+                  Linked UUID: <span className="font-mono text-foreground">{driver.id}</span>
+                </span>
+              )}
+            </div>
+          </section>
 
           {gapLeg && (
             <div className="rounded-2xl bg-warning/10 border border-warning/20 px-5 py-4">
